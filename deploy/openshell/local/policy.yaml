@@ -53,12 +53,39 @@ network_policies:
     binaries:
       - { path: "/**" }
 
-  # Anthropic, for the claude harness. L4 passthrough keeps the agent's TLS
-  # end-to-end instead of terminating it at the supervisor proxy.
+  # Model providers for the configured harnesses. L4 passthrough keeps each
+  # agent's TLS end-to-end instead of terminating it at the supervisor proxy.
+  # Anything not listed here is denied, so a new provider needs a row.
   llm_anthropic:
     name: llm-anthropic
     endpoints:
       - { host: "api.anthropic.com", port: 443, protocol: tcp }
       - { host: "statsig.anthropic.com", port: 443, protocol: tcp }
+    binaries:
+      - { path: "/**" }
+
+  # opencode (zai-coding-plan) and pi (zai) both resolve to api.z.ai.
+  llm_zai:
+    name: llm-zai
+    endpoints:
+      - { host: "api.z.ai", port: 443, protocol: tcp }
+    binaries:
+      - { path: "/**" }
+
+  # opencode (alibaba-token-plan) and pi (qwen-token-plan), per the base URL in
+  # the local pi models store.
+  llm_qwen:
+    name: llm-qwen
+    endpoints:
+      - { host: "token-plan.ap-southeast-1.maas.aliyuncs.com", port: 443, protocol: tcp }
+    binaries:
+      - { path: "/**" }
+
+  # opencode resolves its provider/model catalog and config schema at startup.
+  opencode_catalog:
+    name: opencode-catalog
+    endpoints:
+      - { host: "models.dev", port: 443, protocol: tcp }
+      - { host: "opencode.ai", port: 443, protocol: tcp }
     binaries:
       - { path: "/**" }
