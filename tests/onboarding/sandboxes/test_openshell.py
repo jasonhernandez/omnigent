@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
 from omnigent.onboarding.sandboxes.openshell import (
     HOST_IMAGE_ENV_VAR,
+    PROVIDERS_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     WORKSPACE_ENV_VAR,
     OpenShellSandboxLauncher,
@@ -67,8 +69,10 @@ class _FakeOpenShellAPI:
     def exec_background(self, name: str, command: list[str], *, timeout: int) -> None:
         self.background_calls.append((name, list(command)))
 
-    def create_sandbox(self, *, image: str, env: dict[str, str]) -> str:
-        self.create_kwargs.append({"image": image, "env": env})
+    def create_sandbox(
+        self, *, image: str, env: dict[str, str], providers: Sequence[str] = ()
+    ) -> str:
+        self.create_kwargs.append({"image": image, "env": env, "providers": list(providers)})
         return self.created_name
 
     def run_foreground(self, name: str, command: list[str], *, timeout: int) -> int:
@@ -113,7 +117,45 @@ def test_provision_creates_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     sandbox_name = launcher.provision("test-host")
 
     assert sandbox_name == "petname-abc"
-    assert fake.create_kwargs == [{"image": "custom-image:latest", "env": {}}]
+    assert fake.create_kwargs == [{"image": "custom-image:latest", "env": {}, "providers": []}]
+
+
+def test_provision_attaches_configured_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured provider records ride on the create spec."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(
+        image="img:latest", providers=["github-ci", "anthropic-prod"]
+    )
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == ["github-ci", "anthropic-prod"]
+
+
+def test_provision_reads_providers_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset config falls back to the env var, ignoring blanks."""
+    monkeypatch.setenv(PROVIDERS_ENV_VAR, " github-ci , ,anthropic-prod ")
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == ["github-ci", "anthropic-prod"]
+
+
+def test_provision_without_providers_attaches_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No config and no env var attaches nothing."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == []
 
 
 def test_provision_uses_default_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -257,6 +299,44 @@ def test_put_uploads_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     assert "mkdir -p /tmp/oa &&" in command[2]
     assert "cat > /tmp/oa/wheels.tgz" in command[2]
     assert stdin == b"fake-tarball"
+
+
+def test_put_chunks_large_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``put`` splits a file that would exceed the gateway's 1 MiB message cap."""
+    from omnigent.onboarding.sandboxes.openshell import _PUT_CHUNK_BYTES
+
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    payload = bytes(_PUT_CHUNK_BYTES + 17)
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(payload)
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert len(fake.exec_calls) == 2
+    # The first write truncates and the rest append, so a retry starts clean.
+    assert "cat > /tmp/oa/wheels.tgz" in fake.exec_calls[0][1][2]
+    assert "cat >> /tmp/oa/wheels.tgz" in fake.exec_calls[1][1][2]
+    assert b"".join(stdin for _, _, stdin in fake.exec_calls) == payload
+    assert all(len(stdin) <= _PUT_CHUNK_BYTES for _, _, stdin in fake.exec_calls)
+
+
+def test_put_creates_empty_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``put`` still creates a zero-byte file rather than skipping it."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    local_file = tmp_path / "empty"
+    local_file.write_bytes(b"")
+
+    launcher.put("sb-1", local_file, "/tmp/oa/empty")
+
+    [(_, command, stdin)] = fake.exec_calls
+    assert "cat > /tmp/oa/empty" in command[2]
+    assert stdin == b""
 
 
 def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
