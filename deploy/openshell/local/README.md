@@ -128,9 +128,22 @@ openshell sandbox exec -n <sandbox> -- curl -s -o /dev/null -w '%{http_code}\n' 
 
 A blocked host returns `000`.
 
-`pi` reports `needs-auth` until a pi provider is configured in Omnigent itself
-(`omnigent setup`, or the web UI) — its own `~/.pi/agent/auth.json` is not
-enough, because pi-native routes through the Omnigent provider config.
+`pi` reports `needs-auth` until a pi provider is configured in Omnigent itself:
+its own `~/.pi/agent/auth.json` is not enough, because pi-native routes through
+the Omnigent provider config. A subscription entry says "use Pi's own native
+auth", so no key enters the config:
+
+```yaml
+providers:
+  pi:
+    cli: pi
+    default: [pi]
+    kind: subscription
+```
+
+`default: [pi]` claims only the pi surface, so it does not collide with a
+`default: true` provider serving the anthropic family. The sandbox needs the
+same `providers:` block as the host — the launcher merges it in.
 
 ## Compute driver
 
