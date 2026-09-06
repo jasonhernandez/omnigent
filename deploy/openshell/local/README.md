@@ -122,6 +122,17 @@ the harness has no reason to trust, and opencode fails with `self signed
 certificate in certificate chain`. OpenShell exports the trust bundle itself
 (`/etc/openshell-tls/`), so only the forwarding is missing.
 
+opencode picks its own default model over the merged model map when nothing
+pins one, which can land on an image model that rejects chat messages
+(`Input should be 'user': input.messages.0.role`). opencode-native adopts the
+top-level `model` from the user's `~/.config/opencode/opencode.json` — note
+that path specifically, not `~/.opencode/` — so pin one there and copy it into
+the sandbox alongside the credentials:
+
+```json
+{ "model": "<provider>/<model>" }
+```
+
 Register the host under a **stable label** (`omnigent sandbox connect
 --host-name <label>`). The hosts table is keyed on (owner, name), so a fixed
 label reuses one row; without it the host is named after the sandbox's
