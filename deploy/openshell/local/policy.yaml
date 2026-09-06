@@ -47,7 +47,9 @@ network_policies:
     name: omnigent-server
     endpoints:
       - host: host.openshell.internal
-        ports: [6767, 6868]
+        # 16767 is the bridge forwarder (see the launcher: it cannot reuse 6767
+        # without making `omnigent server` think that port is taken).
+        ports: [6767, 6868, 16767]
         protocol: tcp
         allowed_ips: [172.16.0.0/12]
     binaries:
