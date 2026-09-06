@@ -51,6 +51,21 @@ RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_$
  && rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_amd64" \
  && gh --version | head -1
 
+# GitLab CLI, same reasoning as `gh` above: the gitlab provider profile
+# allow-lists `glab` and `git` as credential-bearing binaries, not `curl`.
+# Note the split of duties — with no `POST /api/**` in that profile, `glab`
+# here is for READS (`glab mr list`, `glab ci status`, `glab api` GETs);
+# creating an MR goes through git push options
+# (`git push -o merge_request.create`), which ride inside git-receive-pack and
+# need no API allowance at all.
+ARG GLAB_VERSION=1.116.0
+RUN curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.tar.gz" \
+      -o /tmp/glab.tgz \
+ && tar -xzf /tmp/glab.tgz -C /tmp \
+ && install -m 0755 /tmp/bin/glab /usr/local/bin/glab \
+ && rm -rf /tmp/glab.tgz /tmp/bin \
+ && glab --version | head -1
+
 # Copied LAST on purpose. The policy changes on nearly every iteration, and a
 # COPY high in the file invalidates every layer beneath it — including the npm
 # install, which then needs the network to rebuild and fails outright whenever
