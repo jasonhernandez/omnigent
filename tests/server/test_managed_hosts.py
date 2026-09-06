@@ -476,6 +476,8 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
     assert fake.cpus == 8
     assert fake.memory_mib == 16384
     assert fake.clone_from is None
+    assert fake.allow_net is None
+    assert fake.secrets is None
 
 
 def test_parse_boxlite_without_section_defaults_local(
@@ -500,6 +502,8 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.cpus is None
     assert fake.memory_mib is None
     assert fake.clone_from is None
+    assert fake.allow_net is None
+    assert fake.secrets is None
 
 
 def test_parse_boxlite_local_customization_reaches_launcher(
@@ -558,6 +562,47 @@ def test_parse_boxlite_clone_from_reaches_launcher(
     install_fake_boxlite_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
     assert fake.clone_from == "warm-rust"
+
+
+def test_parse_boxlite_allow_net_and_secrets_reach_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `sandbox.boxlite.allow_net` and `sandbox.boxlite.secrets` reach the
+    launcher: a DNS allow-list, plus credential entries that carry env var
+    NAMES (never values) and the box variable receiving the placeholder.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://s.example.com",
+            "boxlite": {
+                "allow_net": ["api.anthropic.com", "github.com"],
+                "secrets": [
+                    {
+                        "name": "claude",
+                        "source_env": "CLAUDE_CODE_OAUTH_TOKEN",
+                        "hosts": ["api.anthropic.com"],
+                        "inject_env": "CLAUDE_CODE_OAUTH_TOKEN",
+                    }
+                ],
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.allow_net == ["api.anthropic.com", "github.com"]
+    assert fake.secrets == [
+        {
+            "name": "claude",
+            "source_env": "CLAUDE_CODE_OAUTH_TOKEN",
+            "inject_env": "CLAUDE_CODE_OAUTH_TOKEN",
+            "hosts": ["api.anthropic.com"],
+        }
+    ]
 
 
 def test_parse_valid_islo_config_builds_parameterized_factory(
@@ -1498,6 +1543,70 @@ def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> Non
         (
             {"provider": "boxlite", "server_url": "https://s", "boxlite": {"clone_from": "  "}},
             "sandbox.boxlite.clone_from",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"allow_net": []}},
+            "sandbox.boxlite.allow_net",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"allow_net": "github.com"},
+            },
+            "sandbox.boxlite.allow_net",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"secrets": []}},
+            "sandbox.boxlite.secrets",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"secrets": ["gh"]}},
+            "sandbox.boxlite.secrets[0]",
+        ),
+        # Every secret entry key is required, and unknown ones are typos.
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"secrets": [{"name": "gh", "hosts": ["github.com"]}]},
+            },
+            "sandbox.boxlite.secrets[0].inject_env",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {
+                    "secrets": [
+                        {
+                            "name": "gh",
+                            "source_env": "GIT_TOKEN",
+                            "inject_env": "GH_TOKEN",
+                            "hosts": [],
+                        }
+                    ]
+                },
+            },
+            "sandbox.boxlite.secrets[0].hosts",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {
+                    "secrets": [
+                        {
+                            "name": "gh",
+                            "source_env": "GIT_TOKEN",
+                            "inject_env": "GH_TOKEN",
+                            "hosts": ["github.com"],
+                            "hots": ["typo"],
+                        }
+                    ]
+                },
+            },
+            "unknown key",
         ),
         # boxlite mode blocks (local / cloud are mutually exclusive).
         (

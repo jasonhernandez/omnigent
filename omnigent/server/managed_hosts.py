@@ -74,7 +74,16 @@ stores into ``create_app``):
            clone_from: warm-rust    # shared; clone this STOPPED operator-owned
                                     # box copy-on-write instead of booting the
                                     # image. image/cpus/memory_mib/disk_size_gb
-                                    # then describe the SOURCE box.
+                                    # then describe the SOURCE box, and
+                                    # allow_net/secrets cannot be combined with it.
+           allow_net: [api.anthropic.com, github.com]  # shared; DNS allow-list.
+                                    # Omit for full egress; a list must also
+                                    # cover this server's own host.
+           secrets:                 # shared; value stays on the SERVER, the box
+             - name: claude         # only sees <BOXLITE_SECRET:claude>
+               source_env: CLAUDE_CODE_OAUTH_TOKEN   # SERVER env var NAME
+               hosts: [api.anthropic.com]            # where it is substituted
+               inject_env: CLAUDE_CODE_OAUTH_TOKEN   # BOX env var = placeholder
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -1293,6 +1302,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 "cpus",
                 "memory_mib",
                 "clone_from",
+                "allow_net",
+                "secrets",
             },
             "sandbox.boxlite",
         )
@@ -1307,6 +1318,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             _parse_provider_positive_int(raw, "boxlite", "cpus"),
             _parse_provider_positive_int(raw, "boxlite", "memory_mib"),
             _parse_provider_string(raw, "boxlite", "clone_from"),
+            _parse_boxlite_allow_net(section),
+            _parse_boxlite_secrets(section),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -1659,6 +1672,8 @@ def _boxlite_launcher_factory(
     cpus: int | None,
     memory_mib: int | None,
     clone_from: str | None,
+    allow_net: list[str] | None,
+    secrets: list[dict[str, object]] | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
@@ -1683,6 +1698,9 @@ def _boxlite_launcher_factory(
         (4096).
     :param clone_from: Name of a stopped warm box to clone copy-on-write, or
         ``None`` to boot ``image``.
+    :param allow_net: Hostnames the box may resolve, or ``None`` for full egress.
+    :param secrets: Host-side credential entries (``name`` / ``source_env`` /
+        ``hosts`` / ``inject_env``), or ``None``.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
@@ -1700,6 +1718,8 @@ def _boxlite_launcher_factory(
             cpus=cpus,
             memory_mib=memory_mib,
             clone_from=clone_from,
+            allow_net=allow_net,
+            secrets=secrets,
         )
 
     return _build
@@ -1827,6 +1847,96 @@ def _parse_boxlite_env(section: dict[str, object]) -> list[str] | None:
             "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', 'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _parse_boxlite_allow_net(section: dict[str, object]) -> list[str] | None:
+    """
+    Extract the optional shared ``sandbox.boxlite.allow_net`` — the DNS
+    allow-list handed to boxlite's ``NetworkSpec``.
+
+    :returns: The validated hostnames, or ``None`` for boxlite's default (full
+        egress).
+    :raises ValueError: When present but not a non-empty list of hostnames.
+    """
+    allow_net = section.get("allow_net")
+    if allow_net is None:
+        return None
+    if (
+        not isinstance(allow_net, list)
+        or not allow_net
+        or not all(isinstance(host, str) and host.strip() for host in allow_net)
+    ):
+        raise ValueError(
+            "server config 'sandbox.boxlite.allow_net' must be a non-empty list of "
+            "hostnames the box may reach, e.g. ['api.anthropic.com', 'github.com'] "
+            "(omit it for full egress). It must also cover this server's own host."
+        )
+    return [host.strip() for host in allow_net]
+
+
+# Every key one `sandbox.boxlite.secrets` entry may carry; all four are required.
+_BOXLITE_SECRET_KEYS: set[str] = {"name", "source_env", "hosts", "inject_env"}
+
+
+def _parse_boxlite_secrets(section: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract the optional shared ``sandbox.boxlite.secrets`` list.
+
+    Each entry names a credential rather than carrying it (12-factor):
+    ``source_env`` is the SERVER environment variable holding the value,
+    ``hosts`` the endpoints boxlite substitutes it into, and ``inject_env`` the
+    BOX variable that receives the ``<BOXLITE_SECRET:name>`` placeholder. The
+    launcher resolves the values and rejects name/``inject_env`` collisions;
+    this parse checks the config's shape.
+
+    :returns: The validated entries, or ``None`` when omitted.
+    :raises ValueError: When the list or any entry is malformed.
+    """
+    secrets = section.get("secrets")
+    if secrets is None:
+        return None
+    if not isinstance(secrets, list) or not secrets:
+        raise ValueError(
+            "server config 'sandbox.boxlite.secrets' must be a non-empty list of "
+            "{name, source_env, hosts, inject_env} entries"
+        )
+    return [_parse_boxlite_secret_entry(entry, index) for index, entry in enumerate(secrets)]
+
+
+def _parse_boxlite_secret_entry(entry: object, index: int) -> dict[str, object]:
+    """
+    Validate the shape of one ``sandbox.boxlite.secrets`` entry.
+
+    :param entry: The raw list element.
+    :param index: Its position, so the error names the offending entry.
+    :returns: The validated entry.
+    :raises ValueError: When the entry is not a mapping of the four required
+        keys with well-formed values.
+    """
+    path = f"sandbox.boxlite.secrets[{index}]"
+    if not isinstance(entry, dict):
+        raise ValueError(f"server config '{path}' must be a mapping")
+    _reject_unknown_keys(entry, _BOXLITE_SECRET_KEYS, path)
+    for key in sorted(_BOXLITE_SECRET_KEYS - {"hosts"}):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"server config '{path}.{key}' must be a non-empty string")
+    hosts = entry.get("hosts")
+    if (
+        not isinstance(hosts, list)
+        or not hosts
+        or not all(isinstance(host, str) and host.strip() for host in hosts)
+    ):
+        raise ValueError(
+            f"server config '{path}.hosts' must be a non-empty list of hostnames the "
+            "secret is substituted into, e.g. ['api.anthropic.com']"
+        )
+    return {
+        "name": str(entry["name"]).strip(),
+        "source_env": str(entry["source_env"]).strip(),
+        "inject_env": str(entry["inject_env"]).strip(),
+        "hosts": [host.strip() for host in hosts],
+    }
 
 
 def _parse_boxlite_home_dir(local: dict[str, object]) -> str | None:
