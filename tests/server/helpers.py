@@ -439,6 +439,8 @@ def install_fake_boxlite_launcher(
         memory_mib: int | None = None,
         agent_resources: dict[str, dict[str, int]] | None = None,
         clone_from: str | None = None,
+        allow_net: list[str] | None = None,
+        secrets: list[dict[str, object]] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.endpoint = endpoint
@@ -451,6 +453,8 @@ def install_fake_boxlite_launcher(
         fake.memory_mib = memory_mib
         fake.agent_resources = agent_resources
         fake.clone_from = clone_from
+        fake.allow_net = allow_net
+        fake.secrets = secrets
         return fake
 
     monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)
