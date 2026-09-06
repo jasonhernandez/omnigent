@@ -474,6 +474,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.disk_size_gb == 100
+    assert fake.clone_from is None
 
 
 def test_parse_boxlite_without_section_defaults_local(
@@ -580,6 +581,7 @@ def test_parse_boxlite_resources_default_to_none_when_omitted(
     assert cfg.launcher_factory() is fake
     assert fake.cpus is None
     assert fake.memory_mib is None
+    assert fake.clone_from is None
 
 
 @pytest.mark.parametrize("key", ["cpus", "memory_mib"])
@@ -630,6 +632,28 @@ def test_parse_boxlite_local_customization_reaches_launcher(
         "username_env": "GHCR_USER",
         "password_env": "GHCR_PAT",
     }
+
+
+def test_parse_boxlite_clone_from_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `sandbox.boxlite.clone_from` names the operator-owned warm box the launcher
+    clones copy-on-write instead of booting the image.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://s.example.com",
+            "boxlite": {"clone_from": "warm-rust"},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.clone_from == "warm-rust"
 
 
 def test_parse_valid_islo_config_builds_parameterized_factory(
@@ -1702,6 +1726,10 @@ def test_parse_microsandbox_public_server_keeps_explicit_host_ports(
         (
             {"provider": "boxlite", "server_url": "https://s", "boxlite": {"env": "OPENAI"}},
             "sandbox.boxlite.env",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"clone_from": "  "}},
+            "sandbox.boxlite.clone_from",
         ),
         # boxlite mode blocks (local / cloud are mutually exclusive).
         (
