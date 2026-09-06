@@ -39,6 +39,18 @@ RUN chmod 0644 /etc/profile.d/zz-omnigent-relay.sh \
 COPY credentials-profile.sh /etc/profile.d/zz-omnigent-credentials.sh
 RUN chmod 0644 /etc/profile.d/zz-omnigent-credentials.sh
 
+# GitHub CLI. The github provider profile allow-lists `gh` (and `git`) as
+# credential-bearing binaries but NOT `curl`, so a REST-based PR flow is denied
+# under OpenShell while `gh` is not — an OpenShell landing agent that opens a
+# PR needs this binary present.
+ARG GH_VERSION=2.63.2
+RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+      -o /tmp/gh.tgz \
+ && tar -xzf /tmp/gh.tgz -C /tmp \
+ && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+ && rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_amd64" \
+ && gh --version | head -1
+
 # Copied LAST on purpose. The policy changes on nearly every iteration, and a
 # COPY high in the file invalidates every layer beneath it — including the npm
 # install, which then needs the network to rebuild and fails outright whenever
