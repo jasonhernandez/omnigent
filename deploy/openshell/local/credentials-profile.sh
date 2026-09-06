@@ -18,3 +18,22 @@ export GIT_TOKEN="${GIT_TOKEN:-$api_token}"
 export GIT_USERNAME="${GIT_USERNAME:-x-access-token}"
 export GITHUB_TOKEN="${GITHUB_TOKEN:-$api_token}"
 export GH_TOKEN="${GH_TOKEN:-$api_token}"
+
+# opencode and pi authenticate from auth.json files rather than env vars, so an
+# injected placeholder only reaches them if it is written into that file. Swap
+# just the alibaba-token-plan entry (the qwen-token-plan provider's endpoint is
+# the one bound in policy.yaml); anything else in the file is left alone.
+if [ -n "${OPENAI_API_KEY:-}" ] && [ -f "$HOME/.local/share/opencode/auth.json" ]; then
+  python3 - "$HOME/.local/share/opencode/auth.json" "$OPENAI_API_KEY" <<'PYEOF' 2>/dev/null || true
+import json, sys
+path, placeholder = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    auth = json.load(fh)
+entry = auth.get("alibaba-token-plan")
+if isinstance(entry, dict) and entry.get("key") != placeholder:
+    entry["key"] = placeholder
+    with open(path, "w") as fh:
+        json.dump(auth, fh)
+PYEOF
+fi
+
