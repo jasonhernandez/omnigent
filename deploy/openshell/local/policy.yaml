@@ -35,71 +35,45 @@ process:
   run_as_group: sandbox
 
 network_policies:
-  # The Omnigent server, reached at the OpenShell-managed docker bridge gateway
-  # (172.18.0.1 is how a sandbox addresses the host running the server; the
-  # server must bind something other than loopback — see README). Declared as
-  # `protocol: tcp` for L4 passthrough rather than an L7 protocol: the host
-  # opens a WebSocket tunnel to /v1/hosts/<id>/tunnel, and an L7 (rest) endpoint
-  # proxies plain HTTP but refuses the upgrade, leaving the host retrying
-  # "Connect call failed" forever. 6767 is the default port, 6868 the test one.
-  # The Omnigent server on the host machine. `host.openshell.internal` is the
-  # name OpenShell resolves to the host from inside a sandbox; a `protocol: tcp`
-  # endpoint must use a DNS name (an IP literal is rejected as an unsafe policy,
-  # which silently drops the whole file back to the restrictive default), so the
-  # host IP rides in allowed_ips instead. L4 passthrough rather than an L7
-  # protocol because the host opens a WebSocket tunnel to
-  # /v1/hosts/<id>/tunnel, and an L7 endpoint proxies plain HTTP but refuses
-  # the upgrade. 6767 is the default server port, 6868 the test one.
+  # Relatively permissive, with one hard constraint learned the hard way: a
+  # wildcard row must NOT overlap a port an attached provider's endpoints use.
+  # An attached provider contributes its own endpoints (github → github.com +
+  # api.github.com:443, the claude profile → api.anthropic.com:443), and an
+  # overlapping row here makes the sandbox's whole policy sync fail — it dies
+  # in Provisioning with "Policy discovery sync failed", never a policy error.
+  # So port 80 is wildcarded, and 443 is listed host by host for the hosts NO
+  # provider owns. Anything a provider owns is deliberately absent below.
+  open_egress_http:
+    name: open-egress-http
+    endpoints:
+      - host: ""
+        ports: [80]
+        allowed_ips: [0.0.0.0/0]
+    binaries:
+      - { path: "/**" }
+
+  # Model providers reached with credentials that still live in the sandbox
+  # (opencode/pi auth files). Hosts owned by an attached OpenShell provider
+  # must not appear here — see the note above.
+  llm_direct:
+    name: llm-direct
+    endpoints:
+      - { host: "api.z.ai", port: 443, protocol: tcp }
+      - { host: "token-plan.ap-southeast-1.maas.aliyuncs.com", port: 443, protocol: tcp }
+      - { host: "models.dev", port: 443, protocol: tcp }
+      - { host: "opencode.ai", port: 443, protocol: tcp }
+    binaries:
+      - { path: "/**" }
+
+  # The Omnigent server on the host machine, via the loopback relay the image
+  # starts. L4 on purpose: the host opens a WebSocket tunnel and an L7 row
+  # proxies plain HTTP but refuses the upgrade.
   omnigent_server:
     name: omnigent-server
     endpoints:
       - host: host.openshell.internal
-        # 16767 is the bridge forwarder (see the launcher: it cannot reuse 6767
-        # without making `omnigent server` think that port is taken).
         ports: [6767, 6868, 16767]
         protocol: tcp
         allowed_ips: [172.16.0.0/12]
-    binaries:
-      - { path: "/**" }
-
-  # Model providers for the configured harnesses. L4 passthrough keeps each
-  # agent's TLS end-to-end instead of terminating it at the supervisor proxy.
-  # Anything not listed here is denied, so a new provider needs a row.
-  llm_anthropic:
-    name: llm-anthropic
-    endpoints:
-      - { host: "api.anthropic.com", port: 443, protocol: tcp }
-      - { host: "statsig.anthropic.com", port: 443, protocol: tcp }
-    binaries:
-      - { path: "/**" }
-
-  # opencode (zai-coding-plan) and pi (zai) both resolve to api.z.ai.
-  llm_zai:
-    name: llm-zai
-    endpoints:
-      - { host: "api.z.ai", port: 443, protocol: tcp }
-    binaries:
-      - { path: "/**" }
-
-  # opencode (alibaba-token-plan) and pi (qwen-token-plan), per the base URL in
-  # the local pi models store. L4 like the rows above: credential substitution
-  # would need an L7 row plus a credential_binding, but a binding only resolves
-  # for a provider whose TYPE has a profile — the built-in `openai` type has
-  # none, and naming it fails the sandbox's whole policy sync
-  # ("provider type has no profile"), not just that row. Needs a custom
-  # provider profile with its own endpoints first.
-  llm_qwen:
-    name: llm-qwen
-    endpoints:
-      - { host: "token-plan.ap-southeast-1.maas.aliyuncs.com", port: 443, protocol: tcp }
-    binaries:
-      - { path: "/**" }
-
-  # opencode resolves its provider/model catalog and config schema at startup.
-  opencode_catalog:
-    name: opencode-catalog
-    endpoints:
-      - { host: "models.dev", port: 443, protocol: tcp }
-      - { host: "opencode.ai", port: 443, protocol: tcp }
     binaries:
       - { path: "/**" }
