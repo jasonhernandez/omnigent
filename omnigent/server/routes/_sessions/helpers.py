@@ -5331,6 +5331,8 @@ async def _provision_managed_sandbox(
     relaunch_host: Host | None,
     provider: str | None = None,
     agent_name: str | None = None,
+    agent_credential_providers: Sequence[str] | None = None,
+    requested_credential_providers: Sequence[str] | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -5354,6 +5356,12 @@ async def _provision_managed_sandbox(
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
+    :param agent_credential_providers: Credential-provider records the
+        session's agent spec declares, or ``None`` to leave the
+        deployment's own setting in force.
+    :param requested_credential_providers: Credential-provider records
+        the session-create request asked for, or ``None``. May only
+        narrow the set above.
     :returns: The launch result, or ``None`` when the launch failed
         (the tracker entry is already settled with the reason).
     """
@@ -5379,6 +5387,8 @@ async def _provision_managed_sandbox(
                 host_store=host_store,
                 repo=repo,
                 agent_name=agent_name,
+                agent_credential_providers=agent_credential_providers,
+                requested_credential_providers=requested_credential_providers,
                 on_stage=_on_stage,
             )
         return await launch_managed_host(
@@ -5388,6 +5398,8 @@ async def _provision_managed_sandbox(
             repo=repo,
             provider=provider,
             agent_name=agent_name,
+            agent_credential_providers=agent_credential_providers,
+            requested_credential_providers=requested_credential_providers,
             on_stage=_on_stage,
         )
     except HTTPException as exc:
