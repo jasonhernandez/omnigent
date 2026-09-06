@@ -7,7 +7,6 @@
 # is the whole delta — see policy.yaml.
 ARG BASE_IMAGE=ghcr.io/omnigent-ai/omnigent-host:latest
 FROM ${BASE_IMAGE}
-COPY policy.yaml /etc/openshell/policy.yaml
 
 # The base image keeps WORKDIR /root for the root-based providers, but OpenShell
 # validates the workspace as the non-root sandbox user before starting it, and
@@ -40,3 +39,8 @@ RUN chmod 0644 /etc/profile.d/zz-omnigent-relay.sh \
 COPY credentials-profile.sh /etc/profile.d/zz-omnigent-credentials.sh
 RUN chmod 0644 /etc/profile.d/zz-omnigent-credentials.sh
 
+# Copied LAST on purpose. The policy changes on nearly every iteration, and a
+# COPY high in the file invalidates every layer beneath it — including the npm
+# install, which then needs the network to rebuild and fails outright whenever
+# this host's DNS is flaky.
+COPY policy.yaml /etc/openshell/policy.yaml
