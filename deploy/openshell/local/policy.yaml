@@ -18,7 +18,14 @@ filesystem_policy:
   read_only: [/usr, /lib, /opt, /proc, /dev/urandom, /app, /etc, /var/log]
   # /opt/venv is read-write (inside the read-only /opt) so the wheel overlay
   # `omnigent sandbox create` performs can install into the image venv.
-  read_write: [/sandbox, /tmp, /dev/null, /opt/venv]
+  # /dev/pts is what lets a pty be allocated: the native harnesses
+  # (claude-native, pi-native, opencode-native) run their CLI under tmux, whose
+  # forkpty() otherwise fails as "out of pty devices" — the mode bits on
+  # /dev/pts/ptmx are 666, so only Landlock is refusing it — and surfaces as
+  # "tmux launch failed: create window failed: fork failed: Permission denied".
+  # Listed as the directory, not /dev/ptmx: that is a symlink into it, and the
+  # supervisor refuses a symlink as a read_write path.
+  read_write: [/sandbox, /tmp, /dev/null, /opt/venv, /dev/pts]
 
 landlock:
   compatibility: best_effort
