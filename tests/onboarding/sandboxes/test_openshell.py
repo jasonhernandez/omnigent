@@ -259,6 +259,44 @@ def test_put_uploads_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     assert stdin == b"fake-tarball"
 
 
+def test_put_chunks_large_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``put`` splits a file that would exceed the gateway's 1 MiB message cap."""
+    from omnigent.onboarding.sandboxes.openshell import _PUT_CHUNK_BYTES
+
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    payload = bytes(_PUT_CHUNK_BYTES + 17)
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(payload)
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert len(fake.exec_calls) == 2
+    # The first write truncates and the rest append, so a retry starts clean.
+    assert "cat > /tmp/oa/wheels.tgz" in fake.exec_calls[0][1][2]
+    assert "cat >> /tmp/oa/wheels.tgz" in fake.exec_calls[1][1][2]
+    assert b"".join(stdin for _, _, stdin in fake.exec_calls) == payload
+    assert all(len(stdin) <= _PUT_CHUNK_BYTES for _, _, stdin in fake.exec_calls)
+
+
+def test_put_creates_empty_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``put`` still creates a zero-byte file rather than skipping it."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    local_file = tmp_path / "empty"
+    local_file.write_bytes(b"")
+
+    launcher.put("sb-1", local_file, "/tmp/oa/empty")
+
+    [(_, command, stdin)] = fake.exec_calls
+    assert "cat > /tmp/oa/empty" in command[2]
+    assert stdin == b""
+
+
 def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``put`` raises when the remote ``cat`` exits non-zero."""
     fake = _FakeOpenShellAPI(exec_result=_FakeExecResult(exit_code=1, stderr="denied"))
