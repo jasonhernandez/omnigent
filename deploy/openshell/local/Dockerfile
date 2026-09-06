@@ -36,3 +36,7 @@ COPY relay-profile.sh /etc/profile.d/zz-omnigent-relay.sh
 RUN chmod 0644 /etc/profile.d/zz-omnigent-relay.sh \
  && chmod 0755 /usr/local/lib/omnigent-proxy-relay.py
 
+# Map injected credential placeholders onto the variables git/gh expect.
+COPY credentials-profile.sh /etc/profile.d/zz-omnigent-credentials.sh
+RUN chmod 0644 /etc/profile.d/zz-omnigent-credentials.sh
+
