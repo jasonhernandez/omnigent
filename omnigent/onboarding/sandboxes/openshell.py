@@ -85,6 +85,10 @@ operations (create, get, delete, wait_ready). Defaults to ``"default"``."""
 
 _DEFAULT_WORKSPACE: str = "default"
 
+# Upload chunk size. The gateway rejects a gRPC message whose decoded size
+# exceeds 1 MiB; stay well under it to leave room for framing overhead.
+_PUT_CHUNK_BYTES = 512 * 1024
+
 _READY_TIMEOUT_S = 300
 _EXEC_TIMEOUT_S = 300
 # A foreground host (`omnigent host`) is held open until Ctrl-C, so its
@@ -501,20 +505,32 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
-        """Copy a local file into the sandbox by piping its bytes to ``cat``."""
-        content = local_path.read_bytes()
+        """Copy a local file into the sandbox by piping its bytes to ``cat``.
+
+        Sent in chunks: an exec's stdin rides in a single gRPC message, whose
+        decoded size the gateway caps at 1 MiB, while the shipped wheel bundle
+        runs to tens of megabytes. The first chunk truncates the destination
+        and the rest append, so a retry of the whole upload still starts clean.
+        An empty file still makes one pass, so it is created rather than skipped.
+        """
         parent = shlex.quote(str(PurePosixPath(remote_path).parent))
         dest = shlex.quote(remote_path)
-        result = self._openshell().execute(
-            sandbox_id,
-            ["bash", "-c", f"mkdir -p {parent} && cat > {dest}"],
-            stdin=content,
-        )
-        if result.exit_code != 0:
-            raise click.ClickException(
-                f"File upload to OpenShell sandbox '{sandbox_id}' failed "
-                f"(exit {result.exit_code}): {result.stderr.strip()}"
-            )
+        client = self._openshell()
+        with local_path.open("rb") as handle:
+            first = True
+            while (chunk := handle.read(_PUT_CHUNK_BYTES)) or first:
+                redirect = ">" if first else ">>"
+                result = client.execute(
+                    sandbox_id,
+                    ["bash", "-c", f"mkdir -p {parent} && cat {redirect} {dest}"],
+                    stdin=chunk,
+                )
+                if result.exit_code != 0:
+                    raise click.ClickException(
+                        f"File upload to OpenShell sandbox '{sandbox_id}' failed "
+                        f"(exit {result.exit_code}): {result.stderr.strip()}"
+                    )
+                first = False
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """
