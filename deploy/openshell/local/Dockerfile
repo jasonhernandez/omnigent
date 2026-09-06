@@ -27,3 +27,12 @@ RUN npm install -g --no-audit --no-fund opencode-ai@~1.18.0 \
  && npm cache clean --force \
  && su sandbox -s /bin/sh -c 'opencode --version'
 
+# Self-starting loopback relay for the server-managed flow, where nothing
+# local can start it: the managed launcher runs `omnigent host` over
+# `bash -lc`, a login shell, so the profile snippet brings the relay up in the
+# same held-open exec. See relay-profile.sh.
+COPY proxy-relay.py /usr/local/lib/omnigent-proxy-relay.py
+COPY relay-profile.sh /etc/profile.d/zz-omnigent-relay.sh
+RUN chmod 0644 /etc/profile.d/zz-omnigent-relay.sh \
+ && chmod 0755 /usr/local/lib/omnigent-proxy-relay.py
+
