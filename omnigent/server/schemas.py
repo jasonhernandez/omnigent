@@ -1341,6 +1341,42 @@ class SessionGitOptions(BaseModel):
         return self
 
 
+# Bound on a session's credential-provider request. Generous next to any
+# real gateway's provider count, so it only stops a pathological payload.
+MAX_SANDBOX_CREDENTIAL_PROVIDERS = 32
+MAX_SANDBOX_CREDENTIAL_PROVIDER_LEN = 256
+
+
+def validate_sandbox_credential_providers(value: list[str] | None) -> None:
+    """
+    Check the SHAPE of a session's credential-provider request.
+
+    Names are opaque to omnigent — the sandbox backend's gateway owns
+    that namespace — so this rejects only malformed input, mirroring the
+    server config's own parser. Whether a name is *allowed* is settled at
+    launch, against the agent spec / server config.
+
+    :param value: The requested provider record names, or ``None``.
+    :raises ValueError: When an entry is blank or over-long, or the list
+        holds more entries than :data:`MAX_SANDBOX_CREDENTIAL_PROVIDERS`.
+    """
+    if value is None:
+        return
+    if len(value) > MAX_SANDBOX_CREDENTIAL_PROVIDERS:
+        raise ValueError(
+            "sandbox_credential_providers accepts at most "
+            f"{MAX_SANDBOX_CREDENTIAL_PROVIDERS} entries"
+        )
+    for name in value:
+        if not name.strip():
+            raise ValueError("sandbox_credential_providers entries must be non-empty names")
+        if len(name) > MAX_SANDBOX_CREDENTIAL_PROVIDER_LEN:
+            raise ValueError(
+                "sandbox_credential_providers entries must be at most "
+                f"{MAX_SANDBOX_CREDENTIAL_PROVIDER_LEN} characters"
+            )
+
+
 class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
@@ -1390,6 +1426,14 @@ class _SessionCreateRequestBase(BaseModel):
         provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
         reports in ``sandbox_providers``. Only valid with
         ``host_type: "managed"``; ``None`` takes the server's first.
+    :param sandbox_credential_providers: Named credential-provider
+        records the sandbox should carry, e.g. ``["gitlab-readonly"]``.
+        Names are opaque to omnigent — the sandbox backend's gateway owns
+        that namespace. May only NARROW what the session's agent spec or
+        the server config declares; naming anything else is a 400, since
+        a request is not a trust boundary that can mint capability. Only
+        valid with ``host_type: "managed"``; ``None`` takes the declared
+        set unchanged.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1486,6 +1530,7 @@ class _SessionCreateRequestBase(BaseModel):
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
     sandbox_provider: str | None = None
+    sandbox_credential_providers: list[str] | None = None
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -1545,6 +1590,7 @@ class _SessionCreateRequestBase(BaseModel):
                     "host_type 'managed' lets the server provision the host; "
                     "host_id must not be set"
                 )
+            validate_sandbox_credential_providers(self.sandbox_credential_providers)
             if self.workspace is not None:
                 try:
                     parse_repo_workspace(self.workspace)
@@ -1557,6 +1603,11 @@ class _SessionCreateRequestBase(BaseModel):
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.sandbox_credential_providers is not None:
+            raise ValueError(
+                "sandbox_credential_providers only applies to host_type 'managed' — "
                 "external hosts are not server-provisioned"
             )
         if self.workspace is not None and is_repo_workspace(self.workspace):
@@ -1639,6 +1690,11 @@ class SessionCreateMetadata(BaseModel):
         provision on ``host_type: "managed"`` (one of the server's
         ``sandbox_providers``); ``None`` takes the server's first. Only
         valid with ``host_type: "managed"``.
+    :param sandbox_credential_providers: Named credential-provider
+        records the sandbox should carry, e.g. ``["gitlab-readonly"]``.
+        May only NARROW what the agent spec or the server config
+        declares. Only valid with ``host_type: "managed"``. Mirrors the
+        JSON create path (:class:`SessionCreateRequest`).
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -1651,6 +1707,7 @@ class SessionCreateMetadata(BaseModel):
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
+    sandbox_credential_providers: list[str] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1685,6 +1742,7 @@ class SessionCreateMetadata(BaseModel):
                     "host_type 'managed' lets the server provision the host; "
                     "host_id must not be set"
                 )
+            validate_sandbox_credential_providers(self.sandbox_credential_providers)
             if self.workspace is not None:
                 try:
                     parse_repo_workspace(self.workspace)
@@ -1697,6 +1755,11 @@ class SessionCreateMetadata(BaseModel):
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.sandbox_credential_providers is not None:
+            raise ValueError(
+                "sandbox_credential_providers only applies to host_type 'managed' — "
                 "external hosts are not server-provisioned"
             )
         if self.workspace is not None and is_repo_workspace(self.workspace):

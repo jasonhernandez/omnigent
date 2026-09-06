@@ -421,7 +421,11 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         hosts as wakeable while every wake fails, so those installs keep
         the honest ``host_offline`` state instead.
         """
-        return replace(super().capabilities, resume_stopped=_sdk_supports_resume())
+        return replace(
+            super().capabilities,
+            resume_stopped=_sdk_supports_resume(),
+            binds_credential_providers=True,
+        )
 
     def __init__(
         self,
@@ -457,6 +461,29 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         self._provider_names = tuple(providers) if providers is not None else None
         self._workspace = workspace or os.environ.get(WORKSPACE_ENV_VAR) or _DEFAULT_WORKSPACE
         self._client: _OpenShellClient | None = None
+
+    def bind_credential_providers(self, providers: Sequence[str]) -> None:
+        """
+        Pin the gateway provider records this launcher's sandbox gets.
+
+        Called by the managed launch path once the effective set is
+        resolved (session request, then agent spec, then deployment
+        config), so one server can hand a read-only profile to an
+        implementer agent and a push-capable one to a landing agent.
+        Overrides the constructor's ``providers`` and the env-var
+        fallback for the lifetime of this launcher.
+
+        :param providers: Provider record names; blanks are dropped.
+        """
+        self._provider_names = tuple(name.strip() for name in providers if name.strip())
+
+    def credential_providers(self) -> list[str]:
+        """The provider records a sandbox created now would carry.
+
+        Reflects the binding if one was made, else the deployment's
+        configured set — the ceiling a per-session request may narrow to.
+        """
+        return self._resolve_providers()
 
     def prepare(self) -> None:
         """Preflight: the SDK must be installed and a gateway resolvable."""

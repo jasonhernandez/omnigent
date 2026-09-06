@@ -146,6 +146,63 @@ def test_provision_reads_providers_from_env(monkeypatch: pytest.MonkeyPatch) -> 
     assert fake.create_kwargs[0]["providers"] == ["github-ci", "anthropic-prod"]
 
 
+def test_bind_credential_providers_overrides_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-launch binding wins over the deployment's configured set."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest", providers=["gitlab-shared"])
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.bind_credential_providers(["gitlab-readonly", " ", " gitlab-comment "])
+    launcher.provision("test-host")
+
+    assert launcher.credential_providers() == ["gitlab-readonly", "gitlab-comment"]
+    assert fake.create_kwargs[0]["providers"] == ["gitlab-readonly", "gitlab-comment"]
+
+
+def test_bind_credential_providers_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binding also wins over the env-var fallback, not just YAML config."""
+    monkeypatch.setenv(PROVIDERS_ENV_VAR, "gitlab-shared")
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.bind_credential_providers(["gitlab-push"])
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == ["gitlab-push"]
+
+
+def test_bind_empty_credential_providers_attaches_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binding an empty set strips the deployment's providers rather than falling back."""
+    monkeypatch.setenv(PROVIDERS_ENV_VAR, "gitlab-shared")
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest", providers=["gitlab-readonly"])
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.bind_credential_providers([])
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == []
+
+
+def test_unbound_credential_providers_report_the_configured_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ceiling a session request narrows to is the configured set."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    launcher = OpenShellSandboxLauncher(image="img:latest", providers=["gitlab-readonly"])
+
+    assert launcher.credential_providers() == ["gitlab-readonly"]
+
+
+def test_launcher_declares_credential_provider_binding() -> None:
+    """The capability the managed launch path gates the binding call on."""
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+
+    assert launcher.capabilities.binds_credential_providers is True
+
+
 def test_provision_without_providers_attaches_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """No config and no env var attaches nothing."""
     monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
