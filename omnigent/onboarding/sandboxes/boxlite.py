@@ -82,8 +82,9 @@ environment at provision time, so secrets never live in config files. The
 server's managed-host config (``sandbox.boxlite.env``) takes precedence when
 set."""
 
-# Resources for the box. Matches the Modal / Daytona launchers: 2 vCPU / 4 GiB
-# is enough for a host running one interactive session.
+# Default resources for the box, used when config sets no cpus / memory_mib.
+# Matches the Modal / Daytona launchers: 2 vCPU / 4 GiB is enough for a host
+# running one interactive session. A compiled-language repo wants more.
 _SANDBOX_CPU: int = 2
 _SANDBOX_MEMORY_MIB: int = 4096
 
@@ -216,6 +217,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         home_dir: str | None = None,
         registry: Mapping[str, object] | None = None,
         disk_size_gb: int | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -248,6 +251,13 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         :param disk_size_gb: Box disk size in GB — the server's
             ``sandbox.boxlite.disk_size_gb`` config. ``None`` uses the SDK's
             own default.
+        :param cpus: vCPUs for every box — the server's
+            ``sandbox.boxlite.cpus`` config. ``None`` uses
+            :data:`_SANDBOX_CPU`. A compiled-language repo (``cargo check`` on a
+            Rust monorepo) wants 8; a reviewer is fine on the default 2.
+        :param memory_mib: Box memory in MiB — the server's
+            ``sandbox.boxlite.memory_mib`` config. ``None`` uses
+            :data:`_SANDBOX_MEMORY_MIB`.
 
         When ``home_dir`` or ``registry`` is set the launcher builds a
         customized ``Boxlite(Options(...))`` runtime; otherwise it uses the
@@ -259,6 +269,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._home_dir = home_dir
         self._registry = dict(registry) if registry is not None else None
         self._disk_size_gb = disk_size_gb
+        self._cpus = cpus
+        self._memory_mib = memory_mib
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -414,8 +426,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             runtime = await self._aruntime()
             options = boxlite.BoxOptions(
                 image=resolved_ref,
-                cpus=_SANDBOX_CPU,
-                memory_mib=_SANDBOX_MEMORY_MIB,
+                cpus=self._cpus or _SANDBOX_CPU,
+                memory_mib=self._memory_mib or _SANDBOX_MEMORY_MIB,
                 disk_size_gb=self._disk_size_gb,
                 env=env,
                 auto_remove=False,

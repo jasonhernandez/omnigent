@@ -455,6 +455,8 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cloud": {"endpoint": "https://boxlite.example.com:8100"},
                 "disk_size_gb": 100,
+                "cpus": 8,
+                "memory_mib": 16384,
             },
         }
     )
@@ -471,6 +473,8 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.disk_size_gb == 100
+    assert fake.cpus == 8
+    assert fake.memory_mib == 16384
 
 
 def test_parse_boxlite_without_section_defaults_local(
@@ -491,6 +495,9 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.image is None
     assert fake.env is None
     assert fake.disk_size_gb is None
+    # Sizing keys omitted: the launcher applies its own 2 / 4096 defaults.
+    assert fake.cpus is None
+    assert fake.memory_mib is None
 
 
 def test_parse_boxlite_local_customization_reaches_launcher(
@@ -1451,6 +1458,18 @@ def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> Non
         (
             {"provider": "boxlite", "server_url": "https://s", "boxlite": {"env": "OPENAI"}},
             "sandbox.boxlite.env",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"cpus": 0}},
+            "sandbox.boxlite.cpus",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"cpus": "8"}},
+            "sandbox.boxlite.cpus",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"memory_mib": -1}},
+            "sandbox.boxlite.memory_mib",
         ),
         # boxlite mode blocks (local / cloud are mutually exclusive).
         (

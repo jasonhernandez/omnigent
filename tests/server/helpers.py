@@ -424,6 +424,8 @@ def install_fake_boxlite_launcher(
         home_dir: str | None = None,
         registry: dict[str, object] | None = None,
         disk_size_gb: int | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.endpoint = endpoint
@@ -432,6 +434,8 @@ def install_fake_boxlite_launcher(
         fake.home_dir = home_dir
         fake.registry = registry
         fake.disk_size_gb = disk_size_gb
+        fake.cpus = cpus
+        fake.memory_mib = memory_mib
         return fake
 
     monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)

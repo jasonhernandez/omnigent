@@ -390,6 +390,17 @@ def test_provision_disk_size_gb_reaches_box_options(
     assert create.options.disk_size_gb == 100
 
 
+def test_provision_cpus_and_memory_reach_box_options(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """``cpus`` / ``memory_mib`` override the 2 / 4096 defaults on ``BoxOptions``."""
+    BoxliteSandboxLauncher(cpus=8, memory_mib=16384).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.cpus == 8
+    assert create.options.memory_mib == 16384
+
+
 def test_provision_image_resolution_order(
     fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
