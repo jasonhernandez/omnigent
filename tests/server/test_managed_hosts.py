@@ -777,6 +777,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cluster": "my-gateway",
                 "workspace": "team-alpha",
+                "providers": ["github-ci", "anthropic-prod"],
             },
         }
     )
@@ -793,6 +794,9 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.cluster == "my-gateway"
     assert fake.workspace == "team-alpha"
+    # Provider records are named, not copied: the gateway resolves their
+    # credentials per request, unlike the `env` names above.
+    assert fake.providers == ["github-ci", "anthropic-prod"]
 
 
 def test_parse_openshell_without_section_defaults(

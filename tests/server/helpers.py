@@ -531,8 +531,9 @@ def install_fake_openshell_launcher(
     Substitute the fake for ``OpenShellSandboxLauncher`` at its public seam.
 
     The managed flow constructs ``OpenShellSandboxLauncher(image=…,
-    env=…, cluster=…)``; the shim records those constructor args on the
-    fake and hands it back, so production code runs unmodified against it.
+    env=…, cluster=…, providers=…)``; the shim records those constructor
+    args on the fake and hands it back, so production code runs unmodified
+    against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
@@ -545,12 +546,14 @@ def install_fake_openshell_launcher(
         env: list[str] | None = None,
         cluster: str | None = None,
         workspace: str | None = None,
+        providers: list[str] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
         fake.cluster = cluster
         fake.workspace = workspace
+        fake.providers = providers
         return fake
 
     monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
