@@ -8,6 +8,7 @@ import re
 import sys
 import types
 import uuid
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,11 +53,13 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
+    resolve_agent_credential_providers,
     resolve_managed_agent_label,
     resume_managed_host,
     terminate_managed_host,
 )
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.spec.types import AgentSpec, ManagedSandboxOpenShellSpec, ManagedSandboxSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -130,6 +133,67 @@ class _ClassifyingFakeSandboxLauncher(FakeSandboxLauncher):
         """Record the threaded agent name, then run the shared exec-model start."""
         self.agent_names.append(agent_name)
         return super().start_host(sandbox_id, **kwargs)
+
+
+class _BindingFakeSandboxLauncher(FakeSandboxLauncher):
+    """
+    A fake that declares ``binds_credential_providers`` and records what it
+    was bound to.
+
+    Stands in for the OpenShell launcher — the only in-tree provider that
+    attaches gateway credential records. The plain :class:`FakeSandboxLauncher`
+    does NOT declare the capability, so a launch naming providers for it is
+    rejected.
+
+    :param configured_providers: What the deployment config / env var
+        already grants, i.e. what a session request may narrow to.
+    """
+
+    def __init__(self, *, configured_providers: Sequence[str] = (), **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._providers = list(configured_providers)
+        self.bindings: list[list[str]] = []
+
+    @property
+    def capabilities(self) -> Any:
+        return replace(super().capabilities, binds_credential_providers=True)
+
+    def bind_credential_providers(self, providers: Sequence[str]) -> None:
+        """Record the binding and adopt it as the effective set."""
+        self._providers = [name.strip() for name in providers if name.strip()]
+        self.bindings.append(list(self._providers))
+
+    def credential_providers(self) -> list[str]:
+        """The set a sandbox created now would carry."""
+        return list(self._providers)
+
+
+class _StubAgentCache:
+    """Minimal AgentCache stand-in returning a crafted spec per agent id."""
+
+    def __init__(self, specs: dict[str, AgentSpec]) -> None:
+        self._specs = specs
+        self.loads: list[str] = []
+
+    def load(self, agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+        self.loads.append(agent_id)
+        return SimpleNamespace(spec=self._specs[agent_id], workdir=Path("/nonexistent"))
+
+
+def _builtin_agent_with_providers(name: str, providers: Sequence[str] | None) -> tuple[Agent, Any]:
+    """A genuine built-in agent row plus the spec its bundle parses to."""
+    agent = Agent(
+        id=builtin_agent_id(name),
+        created_at=now_epoch(),
+        name=name,
+        bundle_location=f"{builtin_agent_id(name)}/sha",
+    )
+    managed_sandbox = (
+        None
+        if providers is None
+        else ManagedSandboxSpec(openshell=ManagedSandboxOpenShellSpec(providers=tuple(providers)))
+    )
+    return agent, AgentSpec(spec_version=1, name=name, managed_sandbox=managed_sandbox)
 
 
 class _StubAgentStore:
@@ -3655,6 +3719,203 @@ def test_resolve_agent_label_survives_store_error() -> None:
     """A store error degrades to None (label is an optimization, never fails create)."""
     store = _StubAgentStore(error=True)
     assert resolve_managed_agent_label(store, generate_agent_id(), session_id="conv_1") is None
+
+
+# ── per-agent credential providers ──────────────────────────
+
+
+def _binding_deployment(launcher: FakeSandboxLauncher) -> ManagedSandboxDeployment:
+    """A one-provider deployment around a prebuilt launcher."""
+    return ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+            provider="openshell",
+        )
+    )
+
+
+def _registering_launcher(host_store: HostStore, **kwargs: Any) -> _BindingFakeSandboxLauncher:
+    """A binding fake whose host start registers the row the launch polls for."""
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    return _BindingFakeSandboxLauncher(on_host_start=_register, **kwargs)
+
+
+def test_resolve_agent_credential_providers_reads_builtin_spec() -> None:
+    """A genuine built-in's managed_sandbox block reaches the launch path."""
+    agent, spec = _builtin_agent_with_providers("implementer", ["gitlab-readonly"])
+    store = _StubAgentStore({agent.id: agent})
+    cache = _StubAgentCache({agent.id: spec})
+
+    resolved = resolve_agent_credential_providers(store, cache, agent.id, session_id="conv_1")
+
+    assert resolved == ["gitlab-readonly"]
+    assert cache.loads == [agent.id]
+
+
+def test_resolve_agent_credential_providers_ignores_session_scoped_agent() -> None:
+    """
+    The anti-spoof: a session-scoped agent declaring providers is ignored, so a
+    user-uploaded bundle cannot mint a credential for itself.
+    """
+    agent, spec = _builtin_agent_with_providers("implementer", ["gitlab-push"])
+    impostor = replace(agent, session_id="conv_owner")
+    store = _StubAgentStore({impostor.id: impostor})
+    cache = _StubAgentCache({impostor.id: spec})
+
+    assert (
+        resolve_agent_credential_providers(store, cache, impostor.id, session_id="conv_1") is None
+    )
+    assert cache.loads == []
+
+
+def test_resolve_agent_credential_providers_absent_block_is_none() -> None:
+    """An agent declaring no managed_sandbox block leaves the deployment's set alone."""
+    agent, spec = _builtin_agent_with_providers("plain", None)
+    store = _StubAgentStore({agent.id: agent})
+    cache = _StubAgentCache({agent.id: spec})
+
+    assert resolve_agent_credential_providers(store, cache, agent.id, session_id="conv_1") is None
+
+
+def test_resolve_agent_credential_providers_without_cache_is_none() -> None:
+    """A stripped wiring with no agent cache skips the spec read entirely."""
+    agent, _ = _builtin_agent_with_providers("implementer", ["gitlab-readonly"])
+    store = _StubAgentStore({agent.id: agent})
+
+    assert resolve_agent_credential_providers(store, None, agent.id, session_id="conv_1") is None
+
+
+async def test_launch_binds_agent_declared_credential_providers(db_uri: str) -> None:
+    """Providers an agent spec declares are bound onto the launcher before provisioning."""
+    host_store = HostStore(db_uri)
+    launcher = _registering_launcher(host_store, configured_providers=["gitlab-shared"])
+
+    await launch_managed_host(
+        config=_binding_deployment(launcher),
+        owner=_OWNER,
+        host_store=host_store,
+        agent_credential_providers=["gitlab-readonly"],
+    )
+
+    assert launcher.bindings == [["gitlab-readonly"]]
+    assert launcher.credential_providers() == ["gitlab-readonly"]
+
+
+async def test_launch_session_request_narrows_agent_declared_set(db_uri: str) -> None:
+    """The session request wins over the agent spec when it names a declared subset."""
+    host_store = HostStore(db_uri)
+    launcher = _registering_launcher(host_store)
+
+    await launch_managed_host(
+        config=_binding_deployment(launcher),
+        owner=_OWNER,
+        host_store=host_store,
+        agent_credential_providers=["gitlab-readonly", "gitlab-comment"],
+        requested_credential_providers=["gitlab-comment"],
+    )
+
+    assert launcher.bindings == [["gitlab-readonly", "gitlab-comment"], ["gitlab-comment"]]
+    assert launcher.credential_providers() == ["gitlab-comment"]
+
+
+async def test_launch_session_request_narrows_server_configured_set(db_uri: str) -> None:
+    """With no agent declaration, the request narrows the deployment's own set."""
+    host_store = HostStore(db_uri)
+    launcher = _registering_launcher(
+        host_store, configured_providers=["gitlab-readonly", "gitlab-push"]
+    )
+
+    await launch_managed_host(
+        config=_binding_deployment(launcher),
+        owner=_OWNER,
+        host_store=host_store,
+        requested_credential_providers=["gitlab-readonly"],
+    )
+
+    assert launcher.bindings == [["gitlab-readonly"]]
+
+
+async def test_launch_rejects_session_request_widening_the_declared_set(db_uri: str) -> None:
+    """A request naming an undeclared provider is a 400, not a silent grant."""
+    host_store = HostStore(db_uri)
+    launcher = _registering_launcher(host_store, configured_providers=["gitlab-readonly"])
+
+    with pytest.raises(HTTPException) as excinfo:
+        await launch_managed_host(
+            config=_binding_deployment(launcher),
+            owner=_OWNER,
+            host_store=host_store,
+            agent_credential_providers=["gitlab-readonly"],
+            requested_credential_providers=["gitlab-push"],
+        )
+
+    assert excinfo.value.status_code == 400
+    assert "gitlab-push" in str(excinfo.value.detail)
+    # Rejected before provisioning, so no sandbox leaks.
+    assert launcher.provisioned_names == []
+
+
+async def test_launch_rejects_providers_for_a_non_binding_provider(db_uri: str) -> None:
+    """A provider that cannot attach credential records fails the launch clearly."""
+    host_store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await launch_managed_host(
+            config=_binding_deployment(launcher),
+            owner=_OWNER,
+            host_store=host_store,
+            agent_credential_providers=["gitlab-readonly"],
+        )
+
+    assert excinfo.value.status_code == 400
+    assert "cannot attach named credential providers" in str(excinfo.value.detail)
+    assert launcher.provisioned_names == []
+
+
+async def test_launch_without_any_declaration_leaves_the_launcher_unbound(db_uri: str) -> None:
+    """
+    The unchanged default: a deployment configuring only the server-wide set
+    is never bound, so its own resolution (config then env var) still applies.
+    """
+    host_store = HostStore(db_uri)
+    launcher = _registering_launcher(host_store, configured_providers=["gitlab-shared"])
+
+    await launch_managed_host(
+        config=_binding_deployment(launcher), owner=_OWNER, host_store=host_store
+    )
+
+    assert launcher.bindings == []
+    assert launcher.credential_providers() == ["gitlab-shared"]
+
+
+async def test_relaunch_binds_agent_declared_credential_providers(db_uri: str) -> None:
+    """A fresh sandbox generation carries what the agent declares today."""
+    host_store = HostStore(db_uri)
+    launcher = _registering_launcher(host_store)
+    config = _binding_deployment(launcher)
+
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+
+    await relaunch_managed_host(
+        config=config,
+        host=host,
+        host_store=host_store,
+        agent_credential_providers=["gitlab-push"],
+    )
+
+    assert launcher.bindings == [["gitlab-push"]]
 
 
 # ── relaunch re-derivation (claim-then-resolve) ─────────────

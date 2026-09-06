@@ -150,7 +150,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, cast
@@ -163,6 +163,7 @@ from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.runtime.agent_cache import AgentCache
     from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -295,6 +296,134 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+
+def resolve_agent_credential_providers(
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+    agent_id: str | None,
+    *,
+    session_id: str,
+) -> list[str] | None:
+    """
+    Resolve the credential providers an agent's spec declares, gated to
+    genuine built-ins.
+
+    An attached provider record hands the sandbox a working credential
+    (a push-capable git profile, say), so honoring the declaration from
+    a user-uploaded bundle would let any caller mint capability for
+    itself. The gate is the one :func:`resolve_managed_agent_label`
+    uses — ``session_id is None AND id == builtin_agent_id(name)`` —
+    which only operator-seeded agents pass; anything else is ignored and
+    the deployment's own setting stands.
+
+    Unlike the runner classifier, a failure to READ a built-in's spec is
+    not degraded silently to "no providers": the agent asked for a
+    capability its role needs, and launching without it produces a
+    sandbox that fails confusingly later. Callers surface the raise.
+
+    :param agent_store: Store to resolve the agent record from.
+    :param agent_cache: Cache the agent's bundle is loaded through, or
+        ``None`` (a stripped wiring) to skip the lookup entirely.
+    :param agent_id: The session's bound agent id, or ``None``.
+    :param session_id: Session id, for log correlation only.
+    :returns: Declared provider record names, or ``None`` when the agent
+        declares none / is not a built-in / cannot be resolved.
+    """
+    if agent_cache is None or agent_id is None:
+        return None
+    agent = agent_store.get(agent_id)
+    if agent is None:
+        return None
+    if agent.session_id is not None or agent.id != builtin_agent_id(agent.name):
+        _logger.info(
+            "session %s: agent %r (%s) is not a genuine built-in; ignoring any "
+            "managed_sandbox.openshell.providers it declares",
+            session_id,
+            agent.name,
+            agent.id,
+        )
+        return None
+    loaded = agent_cache.load(agent.id, agent.bundle_location, expand_env=True)
+    managed_sandbox = getattr(loaded.spec, "managed_sandbox", None)
+    openshell = getattr(managed_sandbox, "openshell", None)
+    if openshell is None:
+        return None
+    providers = list(openshell.providers)
+    _logger.info(
+        "session %s: agent %r declares sandbox credential providers %s",
+        session_id,
+        agent.name,
+        providers,
+    )
+    return providers
+
+
+def _bind_credential_providers(
+    launcher: SandboxHostLauncher,
+    *,
+    agent_declared: Sequence[str] | None,
+    requested: Sequence[str] | None,
+) -> None:
+    """
+    Pin the credential providers this launch's sandbox will carry.
+
+    Precedence, highest first: the session request, the agent spec, then
+    the deployment's own ``sandbox.<provider>.providers`` / env var. Only
+    the first two are seen here — leaving the launcher unbound is what
+    lets the deployment setting stand, so a server that configures
+    nothing per-agent behaves exactly as before.
+
+    The session request may only NARROW what the operator-controlled
+    sources grant. Dropping push capability for one session is useful;
+    minting it from an API request is privilege escalation, and unlike
+    the agent spec (gated to operator-seeded built-ins) there is no
+    trust boundary a request clears.
+
+    :param launcher: The launcher about to provision.
+    :param agent_declared: Providers the session's agent spec declares,
+        or ``None`` when it declares none.
+    :param requested: Providers the session-create request asked for, or
+        ``None`` when it asked for none.
+    :raises HTTPException: 400 when providers are named for a launcher
+        that cannot bind them, or the request names one outside the
+        declared set.
+    """
+    if agent_declared is None and requested is None:
+        return
+    if not launcher.capabilities.binds_credential_providers:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"the '{launcher.provider}' sandbox provider cannot attach named "
+                "credential providers — remove the session's "
+                "sandbox_credential_providers / the agent spec's "
+                "managed_sandbox.openshell.providers, or launch on a provider that supports them"
+            ),
+        )
+    # Declared on the binding launcher alone, so the abstract signature does
+    # not carry these; the capability is the runtime guarantee the static
+    # type cannot express, and the cast is how the caller narrows to them.
+    from omnigent.onboarding.sandboxes.types import CredentialProviderBinding
+
+    binding = cast(CredentialProviderBinding, launcher)
+    if agent_declared is not None:
+        binding.bind_credential_providers(agent_declared)
+    if requested is None:
+        return
+    allowed = set(binding.credential_providers())
+    extra = [name for name in requested if name not in allowed]
+    if extra:
+        offered = ", ".join(sorted(allowed)) or "none"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sandbox credential provider(s) {', '.join(extra)} are not declared "
+                "for this session's agent or this server — a session request may only "
+                f"narrow the declared set (declared: {offered})"
+            ),
+        )
+    binding.bind_credential_providers(requested)
 
 
 def resolve_managed_agent_label(
@@ -2793,6 +2922,8 @@ async def launch_managed_host(
     repo: RepoWorkspace | None = None,
     provider: str | None = None,
     agent_name: str | None = None,
+    agent_credential_providers: Sequence[str] | None = None,
+    requested_credential_providers: Sequence[str] | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2828,6 +2959,13 @@ async def launch_managed_host(
         stamped as the runner Pod's ``omnigent.ai/agent`` classifier by
         providers that declare ``classifies_runner_by_agent`` (Kubernetes),
         or ``None`` to leave it unstamped.
+    :param agent_credential_providers: Credential-provider records the
+        session's agent spec declares (see
+        :func:`resolve_agent_credential_providers`), or ``None`` to leave
+        the deployment's own setting in force.
+    :param requested_credential_providers: Credential-provider records
+        the session-create request asked for, or ``None``. May only
+        narrow the set above.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -2842,6 +2980,11 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
+    _bind_credential_providers(
+        launcher,
+        agent_declared=agent_credential_providers,
+        requested=requested_credential_providers,
+    )
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -2877,6 +3020,8 @@ async def relaunch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     agent_name: str | None = None,
+    agent_credential_providers: Sequence[str] | None = None,
+    requested_credential_providers: Sequence[str] | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2907,6 +3052,11 @@ async def relaunch_managed_host(
     :param agent_name: Server-resolved built-in agent name the session runs,
         re-stamped as the new runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
+    :param agent_credential_providers: Credential-provider records the
+        session's agent spec declares; re-resolved per relaunch so the
+        fresh generation carries what the agent asks for TODAY.
+    :param requested_credential_providers: Credential-provider records
+        the session asked for, or ``None``. May only narrow the above.
     :param on_stage: Progress observer forwarded to
         :func:`_register_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -2924,6 +3074,11 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    _bind_credential_providers(
+        launcher,
+        agent_declared=agent_credential_providers,
+        requested=requested_credential_providers,
+    )
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)

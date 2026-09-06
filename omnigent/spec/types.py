@@ -1415,6 +1415,39 @@ class GuardrailsSpec:
     ask_timeout: int = DEFAULT_ASK_TIMEOUT
 
 
+@dataclass(frozen=True)
+class ManagedSandboxOpenShellSpec:
+    """The OpenShell slice of an agent's ``managed_sandbox:`` block.
+
+    :param providers: OpenShell gateway provider record NAMES to attach
+        to the sandbox this agent runs in, e.g. ``("gitlab-readonly",)``.
+        Their credentials reach the sandbox as placeholders the gateway's
+        proxy resolves per request, so the agent gets the capability
+        without ever holding the secret.
+    """
+
+    providers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManagedSandboxSpec:
+    """
+    Top-level ``managed_sandbox:`` block: what the agent needs from the REMOTE
+    sandbox a managed session provisions for it.
+
+    Distinct from ``os_env.sandbox``, which confines the agent's own
+    process (bwrap / seatbelt) once it is already running. This block is
+    read by the SERVER before the sandbox exists, and is keyed by sandbox
+    backend so a knob only one backend understands cannot be declared
+    against another.
+
+    :param openshell: The ``managed_sandbox.openshell:`` sub-block, or ``None``
+        when the agent declares nothing for that backend.
+    """
+
+    openshell: ManagedSandboxOpenShellSpec | None = None
+
+
 @dataclass
 class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (see below)
     """
@@ -1474,6 +1507,15 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         declare ``async: false`` explicitly. See
         ``designs/SERVER_HARNESS_CONTRACT.md`` §Async work +
         inbox + the step-11 sub-step entries.
+    :param managed_sandbox: What the agent needs from the REMOTE sandbox
+        a managed session provisions for it — today only
+        ``managed_sandbox.openshell.providers``, the gateway
+        credential-provider records to attach. Read server-side before
+        the sandbox is created; unrelated to ``os_env.sandbox``
+        (in-process confinement) and ``tools.sandbox`` (local tool
+        container). ``None`` means the agent declares no
+        ``managed_sandbox:`` block and the deployment's own setting
+        applies unchanged.
     :param os_env: The agent's OS environment, e.g.
         ``OSEnvSpec(type="caller_process", cwd=".",
         sandbox=OSEnvSandboxSpec(type="linux_bwrap",
@@ -1585,6 +1627,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    managed_sandbox: ManagedSandboxSpec | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
