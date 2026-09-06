@@ -82,7 +82,12 @@ network_policies:
       - { path: "/**" }
 
   # opencode (alibaba-token-plan) and pi (qwen-token-plan), per the base URL in
-  # the local pi models store.
+  # the local pi models store. L4 like the rows above: credential substitution
+  # would need an L7 row plus a credential_binding, but a binding only resolves
+  # for a provider whose TYPE has a profile — the built-in `openai` type has
+  # none, and naming it fails the sandbox's whole policy sync
+  # ("provider type has no profile"), not just that row. Needs a custom
+  # provider profile with its own endpoints first.
   llm_qwen:
     name: llm-qwen
     endpoints:
