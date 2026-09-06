@@ -359,6 +359,43 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
 
+# Optional hard cap on that idle window. Waiting forever is the safe default
+# for long tool calls, but a wedged CLI is then indistinguishable from a long
+# think: the session stays ``running`` with no way to end it. Operators who
+# would rather see a failed turn than a stuck one set this to a positive
+# number of seconds.
+_STREAM_IDLE_ABORT_ENV = "OMNIGENT_CLAUDE_SDK_STREAM_IDLE_ABORT_SECONDS"
+_DEFAULT_STREAM_IDLE_ABORT_SECONDS = 0.0
+
+
+class ClaudeSdkStreamIdleTimeout(RuntimeError):
+    """The SDK response stream stayed idle past the configured abort limit."""
+
+
+def _stream_idle_abort_seconds() -> float:
+    """Return the idle-abort window in seconds; ``0`` means never abort.
+
+    Reads :envvar:`OMNIGENT_CLAUDE_SDK_STREAM_IDLE_ABORT_SECONDS` on each turn
+    so operators can tune it without a restart. Unset, unparseable, or
+    non-positive values keep the wait-forever behavior.
+    """
+    raw = os.environ.get(_STREAM_IDLE_ABORT_ENV)
+    if not raw:
+        return _DEFAULT_STREAM_IDLE_ABORT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number; leaving the response-stream idle abort disabled.",
+            _STREAM_IDLE_ABORT_ENV,
+            raw,
+        )
+        return _DEFAULT_STREAM_IDLE_ABORT_SECONDS
+    if value <= 0:
+        return _DEFAULT_STREAM_IDLE_ABORT_SECONDS
+    return value
+
+
 # ── Multimodal content block conversion ──────────────────────
 
 
@@ -2855,24 +2892,40 @@ class ClaudeSDKExecutor(Executor):
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
             message_stream = client.receive_response()
+            idle_abort_seconds = _stream_idle_abort_seconds()
             try:
                 while True:
                     next_task = asyncio.ensure_future(anext(message_stream))
+                    # Idle time is per message: any message the stream
+                    # produces starts the accounting over.
                     idle_seconds = 0.0
+                    next_warn_at = _STREAM_IDLE_WARN_SECONDS
                     try:
                         while True:
-                            done, _ = await asyncio.wait(
-                                {next_task}, timeout=_STREAM_IDLE_WARN_SECONDS
-                            )
+                            tick = _STREAM_IDLE_WARN_SECONDS
+                            if idle_abort_seconds > 0:
+                                tick = min(tick, idle_abort_seconds - idle_seconds)
+                            done, _ = await asyncio.wait({next_task}, timeout=tick)
                             if next_task in done:
                                 break
-                            idle_seconds += _STREAM_IDLE_WARN_SECONDS
-                            logger.warning(
-                                "Claude SDK response stream has been idle for "
-                                "%ds (session %s); still waiting.",
-                                int(idle_seconds),
-                                session_key,
-                            )
+                            idle_seconds += tick
+                            if idle_abort_seconds > 0 and idle_seconds >= idle_abort_seconds:
+                                detail = (
+                                    f"Claude SDK response stream was idle for "
+                                    f"{idle_seconds:g}s (session {session_key}); "
+                                    f"aborting the turn. Set {_STREAM_IDLE_ABORT_ENV}=0 "
+                                    f"to wait indefinitely instead."
+                                )
+                                logger.error("%s", detail)
+                                raise ClaudeSdkStreamIdleTimeout(detail)
+                            if idle_seconds >= next_warn_at:
+                                logger.warning(
+                                    "Claude SDK response stream has been idle for "
+                                    "%ds (session %s); still waiting.",
+                                    int(idle_seconds),
+                                    session_key,
+                                )
+                                next_warn_at += _STREAM_IDLE_WARN_SECONDS
                     except BaseException:
                         next_task.cancel()
                         with suppress(BaseException):
