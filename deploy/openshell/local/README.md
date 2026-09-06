@@ -109,8 +109,24 @@ export OMNIGENT_OPENSHELL_SANDBOX_ENV=CLAUDE_CODE_OAUTH_TOKEN
 ```
 
 A listed variable that is not set fails the launch. The runner subprocess does
-not inherit the sandbox's proxy variables; if a harness needs them, add
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy`.
+not inherit the sandbox's proxy variables, and `opencode serve` is launched with
+a filtered environment that passes the proxy vars but **not** the CA ones — so
+name both:
+
+```
+OMNIGENT_RUNNER_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy,NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE
+```
+
+Without the CA half, OpenShell's proxy terminates TLS with an ephemeral CA that
+the harness has no reason to trust, and opencode fails with `self signed
+certificate in certificate chain`. OpenShell exports the trust bundle itself
+(`/etc/openshell-tls/`), so only the forwarding is missing.
+
+Register the host under a **stable label** (`omnigent sandbox connect
+--host-name <label>`). The hosts table is keyed on (owner, name), so a fixed
+label reuses one row; without it the host is named after the sandbox's
+container hostname and every rebuild mints a new identity, leaving the previous
+one behind as an offline entry in the UI's host picker.
 
 Harnesses that authenticate from **files** rather than env vars (claude-native
 on a subscription, opencode, pi) need those files copied into the sandbox
