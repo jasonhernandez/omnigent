@@ -112,8 +112,25 @@ A listed variable that is not set fails the launch. The runner subprocess does
 not inherit the sandbox's proxy variables; if a harness needs them, add
 `OMNIGENT_RUNNER_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy`.
 
-`policy.yaml` allows `api.anthropic.com` for the claude harness — add the
-provider host for any other model, or egress is denied.
+Harnesses that authenticate from **files** rather than env vars (claude-native
+on a subscription, opencode, pi) need those files copied into the sandbox
+instead — `~/.claude/.credentials.json`, `~/.local/share/opencode/auth.json`,
+`~/.pi/agent/`. They are live credentials inside a container running agent
+code, so delete the sandbox when you are done with it.
+
+`policy.yaml` allows the provider hosts those harnesses use — Anthropic, Z.AI,
+the Qwen token plan, and opencode's catalog. Egress is denied by default, so a
+new provider needs a row; verify one with
+
+```bash
+openshell sandbox exec -n <sandbox> -- curl -s -o /dev/null -w '%{http_code}\n' https://<host>/
+```
+
+A blocked host returns `000`.
+
+`pi` reports `needs-auth` until a pi provider is configured in Omnigent itself
+(`omnigent setup`, or the web UI) — its own `~/.pi/agent/auth.json` is not
+enough, because pi-native routes through the Omnigent provider config.
 
 ## Compute driver
 
