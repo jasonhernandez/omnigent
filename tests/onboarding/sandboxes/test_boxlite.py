@@ -45,6 +45,7 @@ class _ExecCall:
 
     command: str
     args: list[str]
+    env: object = None
     timeout_secs: float | None = None
 
 
@@ -104,17 +105,51 @@ class _FakeExecution:
         return _FakeExecResult(exit_code=self._exit_code, error_message=self._error_message)
 
 
+@dataclass
+class _FakeBoxStateInfo:
+    """Stand-in for ``BoxStateInfo`` (only ``running`` is load-bearing)."""
+
+    running: bool = False
+
+
+@dataclass
+class _FakeBoxInfo:
+    """Stand-in for ``BoxInfo`` — ``info().state.running`` gates cloning."""
+
+    state: _FakeBoxStateInfo
+
+
+@dataclass
+class _CloneCall:
+    """One recorded ``box.clone_box`` invocation."""
+
+    source_id: str
+    name: str | None
+    options: object
+
+
 class _FakeBox:
     """Recording stand-in for a boxlite ``Box`` handle."""
 
-    def __init__(self, box_id: str) -> None:
+    def __init__(self, box_id: str, *, running: bool = False) -> None:
         self.id = box_id
+        self.running = running
+        self.clone_result: _FakeBox | None = None
+        self.clone_calls: list[_CloneCall] = []
         self.exec_calls: list[_ExecCall] = []
         # (exit_code, stdout_lines, stderr_lines) handed back by successive
         # exec calls; empty queue yields a success no-output.
         self.exec_queue: list[tuple[int, list[str], list[str]]] = []
         self.exec_raises: Exception | None = None
         self.streams_raise: bool = False  # make stdout()/stderr() raise (SDK shape)
+
+    async def info(self) -> _FakeBoxInfo:
+        return _FakeBoxInfo(state=_FakeBoxStateInfo(running=self.running))
+
+    async def clone_box(self, *, options: object = None, name: str | None = None) -> _FakeBox:
+        self.clone_calls.append(_CloneCall(source_id=self.id, name=name, options=options))
+        assert self.clone_result is not None, "test must set clone_result"
+        return self.clone_result
 
     async def _exec(
         self,
@@ -126,7 +161,7 @@ class _FakeBox:
         **kwargs: object,
     ) -> _FakeExecution:
         self.exec_calls.append(
-            _ExecCall(command=command, args=list(args or []), timeout_secs=timeout_secs)
+            _ExecCall(command=command, args=list(args or []), env=env, timeout_secs=timeout_secs)
         )
         if self.exec_raises is not None:
             raise self.exec_raises
@@ -470,6 +505,94 @@ def test_provision_wraps_sdk_errors_with_provider_reason(
 
     with pytest.raises(click.ClickException, match="no KVM device"):
         BoxliteSandboxLauncher().provision("a")
+
+
+# ── provision: clone_from a warm box ────────────────────────
+
+
+def _add_warm_box(
+    state: _FakeBoxliteState, name: str = "warm-rust", *, running: bool = False
+) -> _FakeBox:
+    """Register a warm source box (plus the clone it hands back) under *name*."""
+    warm = _FakeBox(f"bl-{name}", running=running)
+    warm.clone_result = _FakeBox(f"bl-clone-of-{name}")
+    state.boxes[name] = warm
+    state.boxes[warm.clone_result.id] = warm.clone_result
+    return warm
+
+
+def test_provision_clone_from_clones_warm_box(fake_boxlite: _FakeBoxliteState) -> None:
+    """
+    ``clone_from`` clones the stopped warm box copy-on-write and never boots the
+    image — the whole point is skipping a cold boot plus a cold build cache.
+    """
+    warm = _add_warm_box(fake_boxlite)
+
+    box_id = BoxliteSandboxLauncher(clone_from="warm-rust").provision("managed-abc")
+
+    assert box_id == "bl-clone-of-warm-rust"
+    [clone] = warm.clone_calls
+    assert clone.name == "managed-abc"
+    assert fake_boxlite.create_calls == []
+
+
+def test_provision_clone_from_missing_source_fails_loud(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """A ``clone_from`` naming no box is an operator error, not a silent fallback."""
+    with pytest.raises(click.ClickException, match="clone_from"):
+        BoxliteSandboxLauncher(clone_from="warm-rust").provision("managed-abc")
+    assert fake_boxlite.create_calls == []
+
+
+def test_provision_clone_from_running_source_fails_loud(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """
+    Cloning copies the source's disks, so a RUNNING source would hand the
+    session a mid-write filesystem — refuse rather than clone it.
+    """
+    warm = _add_warm_box(fake_boxlite, running=True)
+
+    with pytest.raises(click.ClickException, match="is running"):
+        BoxliteSandboxLauncher(clone_from="warm-rust").provision("managed-abc")
+    assert warm.clone_calls == []
+
+
+def test_run_applies_env_per_exec_on_a_cloned_box(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``clone_box`` takes no ``BoxOptions``, so a clone never sees
+    ``sandbox.boxlite.env`` — the launcher must supply it through
+    ``box.exec(env=...)``, the SDK's only post-clone lane.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
+    _add_warm_box(fake_boxlite)
+    launcher = BoxliteSandboxLauncher(clone_from="warm-rust", env=["OPENAI_API_KEY"])
+
+    box_id = launcher.provision("managed-abc")
+    launcher.run(box_id, "true")
+
+    [call] = fake_boxlite.boxes[box_id].exec_calls
+    assert call.env == [("OPENAI_API_KEY", "sk-test-123")]
+
+
+def test_run_passes_no_exec_env_without_clone_from(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A box created from the image already carries the env on ``BoxOptions``, so
+    exec keeps the guest's own environment (no per-exec override).
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
+    launcher = BoxliteSandboxLauncher(env=["OPENAI_API_KEY"])
+
+    box_id = launcher.provision("managed-abc")
+    launcher.run(box_id, "true")
+
+    [call] = fake_boxlite.boxes[box_id].exec_calls
+    assert call.env is None
 
 
 # ── local vs cloud runtime switch ───────────────────────────

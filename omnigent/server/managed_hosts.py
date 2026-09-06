@@ -71,6 +71,10 @@ stores into ``create_app``):
            cpus: 8                                     # shared; default: 2
            memory_mib: 16384                           # shared; default: 4096
            disk_size_gb: 100                           # shared; default: SDK default
+           clone_from: warm-rust    # shared; clone this STOPPED operator-owned
+                                    # box copy-on-write instead of booting the
+                                    # image. image/cpus/memory_mib/disk_size_gb
+                                    # then describe the SOURCE box.
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -1280,7 +1284,16 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         section = _boxlite_section(raw)
         _reject_unknown_keys(
             section,
-            {"image", "env", "local", "cloud", "disk_size_gb", "cpus", "memory_mib"},
+            {
+                "image",
+                "env",
+                "local",
+                "cloud",
+                "disk_size_gb",
+                "cpus",
+                "memory_mib",
+                "clone_from",
+            },
             "sandbox.boxlite",
         )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
@@ -1293,6 +1306,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
             _parse_provider_positive_int(raw, "boxlite", "cpus"),
             _parse_provider_positive_int(raw, "boxlite", "memory_mib"),
+            _parse_provider_string(raw, "boxlite", "clone_from"),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -1644,6 +1658,7 @@ def _boxlite_launcher_factory(
     disk_size_gb: int | None,
     cpus: int | None,
     memory_mib: int | None,
+    clone_from: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
@@ -1666,6 +1681,8 @@ def _boxlite_launcher_factory(
     :param cpus: vCPUs per box, or ``None`` for the launcher default (2).
     :param memory_mib: Box memory in MiB, or ``None`` for the launcher default
         (4096).
+    :param clone_from: Name of a stopped warm box to clone copy-on-write, or
+        ``None`` to boot ``image``.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
@@ -1682,6 +1699,7 @@ def _boxlite_launcher_factory(
             disk_size_gb=disk_size_gb,
             cpus=cpus,
             memory_mib=memory_mib,
+            clone_from=clone_from,
         )
 
     return _build
