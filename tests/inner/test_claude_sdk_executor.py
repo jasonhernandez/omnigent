@@ -3304,6 +3304,181 @@ class TestStreamEventStreaming(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tests: response-stream idle watchdog
+# ---------------------------------------------------------------------------
+
+
+class _IdleNoise:
+    """A stream message the executor ignores — only its arrival time matters."""
+
+
+class TestStreamIdleAbort(unittest.TestCase):
+    """Warn forever by default; abort when the operator configures a limit."""
+
+    LOGGER = "omnigent.inner.claude_sdk_executor"
+
+    @staticmethod
+    def _fake_sdk(receive):
+        """Build a fake SDK whose stream is ``receive(result_message_cls)``."""
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                def receive_response(self):
+                    return receive(_ResultMessage)
+
+                async def disconnect(self):
+                    return None
+
+        return _FakeSDK
+
+    def test_idle_stream_warns_but_never_aborts_by_default(self):
+        """Unset env var keeps today's behaviour: warn on every tick, keep waiting."""
+        from omnigent.inner.claude_sdk_executor import (
+            _STREAM_IDLE_ABORT_ENV,
+            ClaudeSDKExecutor,
+        )
+
+        async def _receive(result_cls):
+            # Quiet for several warn ticks, like a long native tool call.
+            await asyncio.sleep(0.25)
+            yield result_cls("claude-session-a", "eventual answer")
+
+        sdk = self._fake_sdk(_receive)
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hi", "session_id": "session-idle"}]
+            with patch.dict(os.environ):
+                os.environ.pop(_STREAM_IDLE_ABORT_ENV, None)
+                with (
+                    patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk),
+                    patch("omnigent.inner.claude_sdk_executor._STREAM_IDLE_WARN_SECONDS", 0.05),
+                    self.assertLogs(self.LOGGER, level=logging.WARNING) as logs,
+                ):
+                    events = [e async for e in executor.run_turn(messages, [], "")]
+
+            self.assertTrue(
+                any("has been idle for" in line for line in logs.output),
+                logs.output,
+            )
+            self.assertFalse(
+                [r for r in logs.records if r.levelno >= logging.ERROR],
+                logs.output,
+            )
+            self.assertFalse([e for e in events if isinstance(e, ExecutorError)])
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(events[-1].response, "eventual answer")
+            self.assertNotIn("session-idle", executor._crashed_sessions)
+
+        _run(_t())
+
+    def test_idle_stream_aborts_after_configured_seconds(self):
+        """A positive limit ends the turn with an error instead of waiting forever."""
+        from omnigent.inner.claude_sdk_executor import (
+            _STREAM_IDLE_ABORT_ENV,
+            ClaudeSDKExecutor,
+        )
+
+        seen = {"cancelled": False}
+
+        async def _receive(result_cls):
+            # A wedged CLI: connected, but nothing ever arrives.
+            try:
+                await asyncio.Event().wait()
+            except BaseException:
+                seen["cancelled"] = True
+                raise
+            yield result_cls("claude-session-a", "unreachable")
+
+        sdk = self._fake_sdk(_receive)
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hi", "session_id": "session-idle-abort"}]
+            with patch.dict(os.environ, {_STREAM_IDLE_ABORT_ENV: "0.25"}):
+                with (
+                    patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk),
+                    patch("omnigent.inner.claude_sdk_executor._STREAM_IDLE_WARN_SECONDS", 0.1),
+                    self.assertLogs(self.LOGGER, level=logging.ERROR) as logs,
+                ):
+                    events = [e async for e in executor.run_turn(messages, [], "")]
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("response stream was idle for 0.25s", errors[0].message)
+            self.assertIn("session-idle-abort", errors[0].message)
+            self.assertTrue(any("aborting the turn" in line for line in logs.output), logs.output)
+            # The pending ``anext`` is cancelled, not left dangling.
+            self.assertTrue(seen["cancelled"])
+            # Standard executor-error handling: client closed, session marked.
+            self.assertEqual(executor._clients, {})
+            self.assertIn("session-idle-abort", executor._crashed_sessions)
+
+        _run(_t())
+
+    def test_stream_message_resets_the_idle_accumulator(self):
+        """Idle time is measured per message, so a chatty-but-slow turn survives."""
+        from omnigent.inner.claude_sdk_executor import (
+            _STREAM_IDLE_ABORT_ENV,
+            ClaudeSDKExecutor,
+        )
+
+        async def _receive(result_cls):
+            # Three 0.25s gaps: 0.75s total, but no single gap hits the 0.4s
+            # limit, so the turn must finish rather than abort.
+            for _ in range(2):
+                await asyncio.sleep(0.25)
+                yield _IdleNoise()
+            await asyncio.sleep(0.25)
+            yield result_cls("claude-session-a", "slow but steady")
+
+        sdk = self._fake_sdk(_receive)
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hi", "session_id": "session-idle-reset"}]
+            with patch.dict(os.environ, {_STREAM_IDLE_ABORT_ENV: "0.4"}):
+                with (
+                    patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk),
+                    patch("omnigent.inner.claude_sdk_executor._STREAM_IDLE_WARN_SECONDS", 0.1),
+                    self.assertLogs(self.LOGGER, level=logging.WARNING) as logs,
+                ):
+                    events = [e async for e in executor.run_turn(messages, [], "")]
+
+            self.assertFalse([r for r in logs.records if r.levelno >= logging.ERROR], logs.output)
+            self.assertFalse([e for e in events if isinstance(e, ExecutorError)])
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(events[-1].response, "slow but steady")
+
+        _run(_t())
+
+
+# ---------------------------------------------------------------------------
 # Tests: _unset_env_var context manager
 # ---------------------------------------------------------------------------
 
