@@ -1,0 +1,64 @@
+# OpenShell sandbox policy for the Omnigent host image (local development).
+#
+# Baked into the image at /etc/openshell/policy.yaml, which is where the
+# OpenShell supervisor resolves it from. Two things make it mandatory:
+#
+#  - Identity. The supervisor refuses to start a sandbox that would run as
+#    root ("OCI USER is required because run_as_user is omitted"). The shared
+#    host image keeps root for the other sandbox providers, so the policy
+#    names the non-root `sandbox` user the image already ships.
+#  - Egress. OpenShell is deny-by-default; without an allow-list the in-sandbox
+#    host cannot dial the server back and the agent cannot reach the model.
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  # /opt carries the Omnigent venv (/opt/venv/bin is first on PATH); without it
+  # Landlock denies exec of `omnigent` itself even though the mode bits allow it.
+  read_only: [/usr, /lib, /opt, /proc, /dev/urandom, /app, /etc, /var/log]
+  # /opt/venv is read-write (inside the read-only /opt) so the wheel overlay
+  # `omnigent sandbox create` performs can install into the image venv.
+  read_write: [/sandbox, /tmp, /dev/null, /opt/venv]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  # The Omnigent server, reached at the OpenShell-managed docker bridge gateway
+  # (172.18.0.1 is how a sandbox addresses the host running the server; the
+  # server must bind something other than loopback — see README). Declared as
+  # `protocol: tcp` for L4 passthrough rather than an L7 protocol: the host
+  # opens a WebSocket tunnel to /v1/hosts/<id>/tunnel, and an L7 (rest) endpoint
+  # proxies plain HTTP but refuses the upgrade, leaving the host retrying
+  # "Connect call failed" forever. 6767 is the default port, 6868 the test one.
+  # The Omnigent server on the host machine. `host.openshell.internal` is the
+  # name OpenShell resolves to the host from inside a sandbox; a `protocol: tcp`
+  # endpoint must use a DNS name (an IP literal is rejected as an unsafe policy,
+  # which silently drops the whole file back to the restrictive default), so the
+  # host IP rides in allowed_ips instead. L4 passthrough rather than an L7
+  # protocol because the host opens a WebSocket tunnel to
+  # /v1/hosts/<id>/tunnel, and an L7 endpoint proxies plain HTTP but refuses
+  # the upgrade. 6767 is the default server port, 6868 the test one.
+  omnigent_server:
+    name: omnigent-server
+    endpoints:
+      - host: host.openshell.internal
+        ports: [6767, 6868]
+        protocol: tcp
+        allowed_ips: [172.16.0.0/12]
+    binaries:
+      - { path: "/**" }
+
+  # Anthropic, for the claude harness. L4 passthrough keeps the agent's TLS
+  # end-to-end instead of terminating it at the supervisor proxy.
+  llm_anthropic:
+    name: llm-anthropic
+    endpoints:
+      - { host: "api.anthropic.com", port: 443, protocol: tcp }
+      - { host: "statsig.anthropic.com", port: 443, protocol: tcp }
+    binaries:
+      - { path: "/**" }
