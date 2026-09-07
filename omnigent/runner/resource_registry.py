@@ -189,6 +189,17 @@ def trim_terminal_output(text: str | None) -> str | None:
     return "\n".join(lines)
 
 
+#: An option NAME, allowlisted. Emphatically not "starts with a dash": a VALUE
+#: can start with one too, and a first-character test leaked every one of these
+#: verbatim — `-kJ8sSecretToken` (about 1 in 64 `secrets.token_urlsafe()`
+#: results begins with `-`), `-phunter2` (mysql/curl-style bundled short
+#: option), and an entire `-----BEGIN OPENSSH PRIVATE KEY-----` blob. Anything
+#: that is not recognisably an option name is redacted, so a bundled short
+#: option like `-v3` is redacted too — correct, because it is indistinguishable
+#: from `-p<password>`.
+_OPTION_NAME_RE = re.compile(r"^(?:--[A-Za-z][A-Za-z0-9._-]{0,63}|-[A-Za-z])$")
+
+
 def redact_argv(args: list[object]) -> tuple[str, ...]:
     """Render argv with option NAMES kept and every value redacted.
 
@@ -208,9 +219,13 @@ def redact_argv(args: list[object]) -> tuple[str, ...]:
     """
     out: list[str] = []
     for raw in args:
-        token = raw if isinstance(raw, str) else str(raw)
-        if token.startswith("-"):
-            name, sep, _value = token.partition("=")
+        try:
+            token = raw if isinstance(raw, str) else str(raw)
+        except Exception:  # noqa: BLE001 - a hostile __str__ must not break the report
+            out.append("<redacted>")
+            continue
+        name, sep, _value = token.partition("=")
+        if _OPTION_NAME_RE.match(name):
             out.append(f"{name}=<redacted>" if sep else name)
         else:
             out.append("<redacted>")
