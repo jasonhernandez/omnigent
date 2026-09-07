@@ -206,6 +206,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             streaming_exec=False,
             foreground_exec=False,
             git_clone_options=super().capabilities.git_clone_options,
+            sizes_sandbox_by_agent=True,
         )
 
     def __init__(
@@ -219,6 +220,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         disk_size_gb: int | None = None,
         cpus: int | None = None,
         memory_mib: int | None = None,
+        agent_resources: Mapping[str, Mapping[str, int]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -272,6 +274,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._disk_size_gb = disk_size_gb
         self._cpus = cpus if cpus is not None else _SANDBOX_CPU
         self._memory_mib = memory_mib if memory_mib is not None else _SANDBOX_MEMORY_MIB
+        self._agent_resources = {
+            str(agent): dict(spec) for agent, spec in (agent_resources or {}).items()
+        }
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -400,7 +405,23 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 "sandbox.boxlite.cloud.endpoint at a remote `boxlite serve`."
             )
 
-    def provision(self, name: str) -> str:
+    def _resources_for(self, agent_name: str | None) -> tuple[int, int]:
+        """Resolve (cpus, memory_mib) for one job.
+
+        A per-agent entry overrides the server-wide value, and may set either
+        field alone. An unknown agent falls back to the server-wide value, so
+        adding an agent never has to touch this map.
+
+        :param agent_name: Resolved built-in agent, or ``None``.
+        :returns: The ``(cpus, memory_mib)`` this box should be created with.
+        """
+        override = self._agent_resources.get(agent_name or "", {})
+        return (
+            int(override.get("cpus", self._cpus)),
+            int(override.get("memory_mib", self._memory_mib)),
+        )
+
+    def provision(self, name: str, *, agent_name: str | None = None) -> str:
         """
         Create a new BoxLite box from the host image.
 
@@ -418,6 +439,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         _ensure_sdk()
         resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         env = self._resolve_sandbox_env()
+        cpus, memory_mib = self._resources_for(agent_name)
         target = self._endpoint or "local"
         click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
 
@@ -427,8 +449,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             runtime = await self._aruntime()
             options = boxlite.BoxOptions(
                 image=resolved_ref,
-                cpus=self._cpus,
-                memory_mib=self._memory_mib,
+                cpus=cpus,
+                memory_mib=memory_mib,
                 disk_size_gb=self._disk_size_gb,
                 env=env,
                 auto_remove=False,
