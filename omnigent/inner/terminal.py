@@ -7,7 +7,6 @@ with optional filesystem isolation (fork) and sandboxing (bwrap/seccomp).
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import logging
 import os
@@ -1003,18 +1002,23 @@ class TerminalInstance:
         :returns: The pane text, or ``None`` when tmux is gone or the pane is
             empty.
         """
-        # BOUNDED. `_tmux_output_sync` calls `subprocess.run` with no timeout,
-        # and every other caller is the daemon watcher thread. This one runs
-        # from `_handle_terminal_exit`, which is scheduled on the runner's event
-        # loop — so before this bound, a wedged tmux server could stall the
-        # whole runner while trying to report a failure. A diagnostic must never
-        # cost more than the diagnosis is worth.
+        # BOUNDED at the subprocess, which is the only place it can be bounded.
+        # An earlier attempt wrapped this in a ThreadPoolExecutor with a
+        # `.result(timeout=…)`; that is INERT, because `__exit__` calls
+        # `shutdown(wait=True)` and joins the wedged worker anyway — measured at
+        # 3.00s against a 0.5s "bound". Every other caller of
+        # `_tmux_output_sync` is the daemon watcher thread; this one runs from
+        # `_handle_terminal_exit` on the runner's event loop, so an unbounded
+        # wait stalls the whole runner while trying to report a failure.
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                out = pool.submit(
-                    self._tmux_output_sync, "capture-pane", "-t", self.tmux_target, "-p"
-                ).result(timeout=self._DEAD_PANE_CAPTURE_TIMEOUT_S)
-        except Exception:
+            out = self._tmux_output_sync(
+                "capture-pane",
+                "-t",
+                self.tmux_target,
+                "-p",
+                timeout=self._DEAD_PANE_CAPTURE_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic must not break the report
             return None
         return out or None
 
@@ -1969,7 +1973,7 @@ class TerminalInstance:
             )
         return stdout.decode()
 
-    def _tmux_output_sync(self, *args: str) -> str:
+    def _tmux_output_sync(self, *args: str, timeout: float | None = None) -> str:
         """
         Synchronous sibling of :meth:`_tmux_output`.
 
@@ -1986,7 +1990,9 @@ class TerminalInstance:
         """
         cmd = [*self._tmux_base_cmd(), *args]
         try:
-            proc = subprocess.run(cmd, capture_output=True, check=False)
+            proc = subprocess.run(
+                cmd, capture_output=True, check=False, timeout=timeout
+            )
         except OSError as exc:
             raise RuntimeError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
         if proc.returncode != 0:
