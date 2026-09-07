@@ -166,6 +166,9 @@ class TerminalExitEvent:
     :param args_count: Number of arguments passed to the executable, if known.
         The event intentionally does not expose argv contents because terminal
         specs may contain credentials or other launch-only secrets.
+    :param args_redacted: Argv with option names kept and every value replaced
+        by ``<redacted>`` — see :func:`redact_argv`. Preserves the original
+        no-values guarantee while making a launch failure diagnosable.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
     :param exit_status: The inner process's exit code, when tmux captured one
@@ -185,6 +188,7 @@ class TerminalExitEvent:
     lifecycle: TerminalLifecycle
     command: str | None = None
     args_count: int | None = None
+    args_redacted: tuple[str, ...] | None = None
     cwd: str | None = None
     last_output: str | None = None
     exit_status: int | None = None
@@ -216,21 +220,53 @@ def trim_terminal_output(text: str | None) -> str | None:
     return "\n".join(lines)
 
 
+def redact_argv(args: list[object]) -> tuple[str, ...]:
+    """Render argv with option NAMES kept and every value redacted.
+
+    A terminal spec may carry credentials, so argv was withheld wholesale and
+    the failure said only how many arguments there were. That makes a harness
+    that dies on its own command line undiagnosable: three separate
+    investigations of a runtime exiting in ~1s were unable to see what it was
+    invoked with.
+
+    Secrets are values, essentially never option names. So an option keeps its
+    name, an inline ``--opt=value`` keeps only the name, and everything else
+    becomes ``<redacted>``. That is enough to see *shape* — which flags were
+    passed, how many operands — without printing a single value.
+
+    :param args: Raw argv tail (excluding the executable).
+    :returns: Redacted tokens, safe to log.
+    """
+    out: list[str] = []
+    for raw in args:
+        token = raw if isinstance(raw, str) else str(raw)
+        if token.startswith("-"):
+            name, sep, _value = token.partition("=")
+            out.append(f"{name}=<redacted>" if sep else name)
+        else:
+            out.append("<redacted>")
+    return tuple(out)
+
+
 def _terminal_exit_diagnostics(
     instance: TerminalInstance | None,
-) -> tuple[str | None, int | None, str | None, str | None, int | None]:
+) -> tuple[
+    str | None, int | None, tuple[str, ...] | None, str | None, str | None, int | None
+]:
     """Extract generic launch/output diagnostics from a terminal instance.
 
-    :returns: ``(command, args_count, cwd, last_output, exit_status)``.
+    :returns: ``(command, args_count, args_redacted, cwd, last_output,
+        exit_status)``.
     """
     if instance is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     raw_command = getattr(instance, "command", None)
     command = raw_command if isinstance(raw_command, str) and raw_command else None
 
     raw_args = getattr(instance, "args", None)
     args_count = len(raw_args) if isinstance(raw_args, list) else None
+    args_redacted = redact_argv(raw_args) if isinstance(raw_args, list) else None
 
     raw_cwd = getattr(instance, "launch_cwd", None)
     cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
@@ -263,7 +299,7 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_exit_status, int):
                 exit_status = raw_exit_status
 
-    return command, args_count, cwd, last_output, exit_status
+    return command, args_count, args_redacted, cwd, last_output, exit_status
 
 
 def _monotonic() -> float:
@@ -1608,7 +1644,9 @@ class SessionResourceRegistry:
     ) -> None:
         """Preserve exit evidence even when a pane dies before observation starts."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
-        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        command, args_count, args_redacted, cwd, last_output, exit_status = (
+            _terminal_exit_diagnostics(instance)
+        )
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1699,6 +1737,7 @@ class SessionResourceRegistry:
                     lifecycle=lifecycle,
                     command=command,
                     args_count=args_count,
+                    args_redacted=args_redacted,
                     cwd=cwd,
                     last_output=last_output,
                     exit_status=exit_status,
