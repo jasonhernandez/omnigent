@@ -784,6 +784,72 @@ def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
 
+class _FakeExitedTerminal:
+    """Minimal stand-in for a terminal that has already exited."""
+
+    command = "/usr/local/bin/pi"
+    args = ["--extension", "/root/ext.js"]
+    launch_cwd = "/root/workspace"
+
+    def __init__(self, remembered=None, dead_capture=None, dead_raises=False):
+        self._remembered = remembered
+        self._dead_capture = dead_capture
+        self._dead_raises = dead_raises
+        self.dead_calls = 0
+
+    def last_pane_text(self):
+        return self._remembered
+
+    def last_exit_status(self):
+        return None
+
+    def capture_dead_pane_sync(self):
+        self.dead_calls += 1
+        if self._dead_raises:
+            raise RuntimeError("tmux gone")
+        return self._dead_capture
+
+
+def test_exit_diagnostics_captures_the_dead_pane_when_nothing_was_remembered() -> None:
+    """A process that dies before the first poll still reports its last frame."""
+    term = _FakeExitedTerminal(
+        remembered=None, dead_capture="Error: Unknown option: --dangerously-skip-permissions"
+    )
+    last_output = _terminal_exit_diagnostics(term)[4]
+    assert last_output == "Error: Unknown option: --dangerously-skip-permissions"
+    assert term.dead_calls == 1
+
+
+def test_exit_diagnostics_prefers_a_remembered_snapshot_over_a_late_capture() -> None:
+    """A real snapshot wins; the dead-pane probe is not even attempted."""
+    term = _FakeExitedTerminal(remembered="the real final frame", dead_capture="stale")
+    assert _terminal_exit_diagnostics(term)[4] == "the real final frame"
+    assert term.dead_calls == 0
+
+
+def test_exit_diagnostics_survives_a_failing_dead_pane_capture() -> None:
+    """This runs while a failure is being reported; it must never raise."""
+    term = _FakeExitedTerminal(remembered=None, dead_raises=True)
+    assert _terminal_exit_diagnostics(term)[4] is None
+
+
+def test_exit_diagnostics_tolerates_a_terminal_without_the_capture_method() -> None:
+    """An older/other terminal object simply reports no output, as before."""
+
+    class _Legacy:
+        command = "x"
+        args: list[str] = []
+        launch_cwd = None
+
+        def last_pane_text(self):
+            return None
+
+        def last_exit_status(self):
+            return None
+
+    assert _terminal_exit_diagnostics(_Legacy())[4] is None
+
+
 def test_redact_argv_keeps_option_names_and_drops_every_value() -> None:
     """Option names survive; operands and inline values do not."""
     assert redact_argv(
