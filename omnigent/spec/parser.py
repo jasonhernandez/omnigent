@@ -39,6 +39,7 @@ from omnigent.spec.types import (
     LabelDef,
     LLMConfig,
     LocalToolInfo,
+    ManagedSandboxBoxliteSpec,
     ManagedSandboxOpenShellSpec,
     ManagedSandboxSpec,
     MCPServerConfig,
@@ -845,7 +846,7 @@ def _parse_os_env(
 # Sandbox backends that read the top-level ``managed_sandbox:`` block. Keyed by
 # backend so a knob only one of them understands cannot be declared
 # against another and then silently ignored.
-_MANAGED_SANDBOX_BACKENDS: tuple[str, ...] = ("openshell",)
+_MANAGED_SANDBOX_BACKENDS: tuple[str, ...] = ("openshell", "boxlite")
 
 
 def _parse_managed_sandbox(raw: object) -> ManagedSandboxSpec | None:
@@ -882,9 +883,14 @@ def _parse_managed_sandbox(raw: object) -> ManagedSandboxSpec | None:
             code=ErrorCode.INVALID_INPUT,
         )
     openshell = _parse_managed_sandbox_openshell(raw.get("openshell"))
-    if openshell is None:
+    boxlite = _parse_managed_sandbox_boxlite(raw.get("boxlite"))
+    # Every backend must be consulted before deciding the block is empty.
+    # Returning on the first absent one silently dropped a block that declared
+    # only the OTHER backend — the same silent-ignore this block's
+    # backend-keying exists to prevent.
+    if openshell is None and boxlite is None:
         return None
-    return ManagedSandboxSpec(openshell=openshell)
+    return ManagedSandboxSpec(openshell=openshell, boxlite=boxlite)
 
 
 def _parse_managed_sandbox_openshell(raw: object) -> ManagedSandboxOpenShellSpec | None:
@@ -919,6 +925,60 @@ def _parse_managed_sandbox_openshell(raw: object) -> ManagedSandboxOpenShellSpec
             code=ErrorCode.INVALID_INPUT,
         )
     return ManagedSandboxOpenShellSpec(providers=tuple(name.strip() for name in names))
+
+
+def _parse_managed_sandbox_boxlite(raw: object) -> ManagedSandboxBoxliteSpec | None:
+    """
+    Parse ``managed_sandbox.boxlite:`` into a :class:`ManagedSandboxBoxliteSpec`.
+
+    Both fields only ever NARROW the deployment's own
+    ``sandbox.boxlite`` config; the enforcement of that lives at launch
+    (``ManagedSandboxConfig.for_agent``), because only the server knows
+    what it offers. This parser checks shape alone, matching how
+    ``providers`` above is left opaque to its own namespace owner.
+
+    ``env: []`` is meaningful and must survive: it means *inject
+    nothing*, which is the strongest narrowing available, so it is
+    distinguished from an absent ``env:`` (keep the deployment's list).
+
+    :param raw: The raw ``boxlite:`` value — a mapping, or absent.
+        Example: ``{"image": "ghcr.io/acme/box@sha256:...", "env": ["MY_TOKEN"]}``.
+    :returns: The parsed sub-block, or ``None`` when absent or declaring
+        nothing.
+    :raises OmnigentError: If *raw* is not a mapping, ``image`` is not a
+        non-empty string, or ``env`` is not a list of non-empty strings.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"managed_sandbox.boxlite must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    image = raw.get("image")
+    if image is not None and not (isinstance(image, str) and image.strip()):
+        raise OmnigentError(
+            "managed_sandbox.boxlite.image must be a non-empty registry image "
+            "reference, e.g. 'ghcr.io/acme/box@sha256:...'",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    names = raw.get("env")
+    if names is not None and (
+        not isinstance(names, list)
+        or not all(isinstance(name, str) and name.strip() for name in names)
+    ):
+        raise OmnigentError(
+            "managed_sandbox.boxlite.env must be a list of environment variable "
+            "NAMES to inject, e.g. ['MY_TOKEN'] — a filter over what the server "
+            "already offers, never a free list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if image is None and names is None:
+        return None
+    return ManagedSandboxBoxliteSpec(
+        image=image.strip() if isinstance(image, str) else None,
+        env=tuple(name.strip() for name in names) if names is not None else None,
+    )
 
 
 def _parse_terminals(

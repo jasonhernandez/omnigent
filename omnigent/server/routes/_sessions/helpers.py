@@ -282,6 +282,7 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.spec.types import (
     AgentSpec,
+    ManagedSandboxSpec,
     Phase,
     PolicyAction,
 )
@@ -5332,6 +5333,7 @@ async def _provision_managed_sandbox(
     provider: str | None = None,
     agent_name: str | None = None,
     agent_credential_providers: Sequence[str] | None = None,
+    agent_managed_sandbox: ManagedSandboxSpec | None = None,
     requested_credential_providers: Sequence[str] | None = None,
 ) -> ManagedHostLaunch | None:
     """
@@ -5356,6 +5358,9 @@ async def _provision_managed_sandbox(
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
+    :param agent_managed_sandbox: The agent's parsed ``managed_sandbox:``
+        block, narrowing the provider config for this launch only, or
+        ``None`` to use the deployment's config unchanged.
     :param agent_credential_providers: Credential-provider records the
         session's agent spec declares, or ``None`` to leave the
         deployment's own setting in force.
@@ -5388,6 +5393,7 @@ async def _provision_managed_sandbox(
                 repo=repo,
                 agent_name=agent_name,
                 agent_credential_providers=agent_credential_providers,
+                agent_managed_sandbox=agent_managed_sandbox,
                 requested_credential_providers=requested_credential_providers,
                 on_stage=_on_stage,
             )
@@ -5399,6 +5405,7 @@ async def _provision_managed_sandbox(
             provider=provider,
             agent_name=agent_name,
             agent_credential_providers=agent_credential_providers,
+            agent_managed_sandbox=agent_managed_sandbox,
             requested_credential_providers=requested_credential_providers,
             on_stage=_on_stage,
         )

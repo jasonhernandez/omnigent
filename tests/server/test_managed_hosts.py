@@ -4589,3 +4589,151 @@ def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
     # keep_alive is what the managed path needs from it, so it must not be the
     # raising capability default it inherits two levels up.
     assert type(launcher).keep_alive is not SandboxHostLauncher.keep_alive
+
+
+# ---------------------------------------------------------------------------
+# Per-agent narrowing of the boxlite image and env (FSXC-859)
+# ---------------------------------------------------------------------------
+
+
+def _boxlite_raw(env: list[str] | None = None, image: str = "srv/host:1") -> dict[str, Any]:
+    """A minimal YAML-shaped boxlite deployment config."""
+    block: dict[str, Any] = {"image": image}
+    if env is not None:
+        block["env"] = env
+    return {
+        "provider": "boxlite",
+        "server_url": "http://srv:6869",
+        "boxlite": block,
+    }
+
+
+def _boxlite_config(env: list[str] | None = None, image: str = "srv/host:1"):
+    from omnigent.server.managed_hosts import _parse_single_provider_sandbox_config
+
+    return _parse_single_provider_sandbox_config(_boxlite_raw(env=env, image=image))
+
+
+def _spec(image: str | None = None, env: tuple[str, ...] | None = None):
+    from omnigent.spec.types import ManagedSandboxBoxliteSpec, ManagedSandboxSpec
+
+    return ManagedSandboxSpec(boxlite=ManagedSandboxBoxliteSpec(image=image, env=env))
+
+
+class TestForAgentNarrowing:
+    """``ManagedSandboxConfig.for_agent`` — the launch-time half of the contract."""
+
+    def test_no_override_returns_self_identically(self) -> None:
+        """Backward compatibility is IDENTITY, not merely equality.
+
+        What breaks if this fails: every existing agent starts taking a
+        re-parse it never used to, so a config that parses today but
+        would not re-parse cleanly begins failing at launch.
+        """
+        cfg = _boxlite_config(env=["A_KEY"])
+        assert cfg.for_agent(None) is cfg
+
+    def test_block_for_another_backend_is_ignored(self) -> None:
+        """Declaring only ``openshell`` leaves a boxlite launch untouched.
+
+        What breaks if this fails: a block keyed for one backend starts
+        erroring on deployments running another, which defeats the point
+        of keying it by backend at all.
+        """
+        from omnigent.spec.types import ManagedSandboxOpenShellSpec, ManagedSandboxSpec
+
+        cfg = _boxlite_config(env=["A_KEY"])
+        override = ManagedSandboxSpec(
+            openshell=ManagedSandboxOpenShellSpec(providers=("gitlab-readonly",))
+        )
+        assert cfg.for_agent(override) is cfg
+
+    def test_env_narrows_to_the_requested_subset(self) -> None:
+        """A subset request really does result in fewer names being injected."""
+        cfg = _boxlite_config(env=["A_KEY", "B_KEY", "C_KEY"])
+        narrowed = cfg.for_agent(_spec(env=("B_KEY",)))
+        assert narrowed.raw_config is not None
+        assert narrowed.raw_config["boxlite"]["env"] == ["B_KEY"]
+
+    def test_empty_env_injects_nothing(self) -> None:
+        """``env: ()`` is the strongest narrowing and must not read as absent."""
+        cfg = _boxlite_config(env=["A_KEY"])
+        narrowed = cfg.for_agent(_spec(env=()))
+        assert narrowed.raw_config is not None
+        assert narrowed.raw_config["boxlite"]["env"] == []
+
+    def test_env_cannot_name_an_unoffered_variable(self) -> None:
+        """THE security requirement: env is a filter, never a free list.
+
+        What breaks if this fails: an uploaded spec could make the server
+        read any variable out of its own process — strictly worse than
+        the shared-credential problem this feature exists to solve.
+        """
+        cfg = _boxlite_config(env=["A_KEY"])
+        with pytest.raises(HTTPException) as exc:
+            cfg.for_agent(_spec(env=("A_KEY", "SECRET_KEY")))
+        assert exc.value.status_code == 400
+        assert "SECRET_KEY" in str(exc.value.detail)
+        assert "not offered by this server" in str(exc.value.detail)
+
+    def test_env_request_against_a_server_offering_none_is_rejected(self) -> None:
+        """A server that configured no env offers nothing to filter."""
+        cfg = _boxlite_config(env=None)
+        with pytest.raises(HTTPException) as exc:
+            cfg.for_agent(_spec(env=("A_KEY",)))
+        assert exc.value.status_code == 400
+        assert "offered: none" in str(exc.value.detail)
+
+    def test_image_is_replaced(self) -> None:
+        cfg = _boxlite_config(env=["A_KEY"], image="srv/host:1")
+        narrowed = cfg.for_agent(_spec(image="agent/host:9"))
+        assert narrowed.raw_config is not None
+        assert narrowed.raw_config["boxlite"]["image"] == "agent/host:9"
+
+    def test_narrowing_does_not_leak_into_the_deployment(self) -> None:
+        """Agent A's narrowing must not starve agent B.
+
+        What breaks if this fails: the first agent to narrow mutates the
+        shared config, and every later agent sees the reduced offer —
+        which surfaces as B being denied a credential the operator did
+        offer it.
+        """
+        cfg = _boxlite_config(env=["A_KEY", "B_KEY"])
+        cfg.for_agent(_spec(env=("A_KEY",)))
+        # The deployment still offers both, so a second agent can still ask
+        # for the one the first one dropped.
+        second = cfg.for_agent(_spec(env=("B_KEY",)))
+        assert second.raw_config is not None
+        assert second.raw_config["boxlite"]["env"] == ["B_KEY"]
+        assert cfg.raw_config is not None
+        assert cfg.raw_config["boxlite"]["env"] == ["A_KEY", "B_KEY"]
+
+    def test_directly_constructed_config_cannot_be_narrowed(self) -> None:
+        """No raw config means nothing to re-parse — fail loud, not silently wide."""
+        from omnigent.server.managed_hosts import ManagedSandboxConfig
+
+        cfg = ManagedSandboxConfig(
+            server_url="http://srv:6869",
+            launcher_factory=lambda: None,  # type: ignore[arg-type,return-value]
+            token_ttl_s=60,
+            provider="boxlite",
+        )
+        with pytest.raises(HTTPException) as exc:
+            cfg.for_agent(_spec(env=()))
+        assert exc.value.status_code == 400
+
+    def test_provider_without_overridable_fields_is_rejected(self) -> None:
+        """A backend that cannot honour the block fails loudly (R4).
+
+        What breaks if this fails: the launch silently proceeds with the
+        deployment's full credential set — the precise outcome the
+        declaring agent was trying to avoid.
+        """
+        from dataclasses import replace as dc_replace
+
+        cfg = dc_replace(_boxlite_config(env=["A_KEY"]), provider="modal")
+        with pytest.raises(HTTPException) as exc:
+            cfg.for_agent(_spec(env=()))
+        assert exc.value.status_code == 400
+        assert "cannot be honoured by sandbox provider" in str(exc.value.detail)
+        assert "boxlite" in str(exc.value.detail)

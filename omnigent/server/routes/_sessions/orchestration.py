@@ -2896,11 +2896,13 @@ async def _run_managed_launch(
     """
     from omnigent.server.managed_hosts import (
         resolve_agent_credential_providers,
+        resolve_agent_managed_sandbox,
         resolve_managed_agent_label,
     )
 
     agent_name: str | None = None
     agent_credential_providers: list[str] | None = None
+    agent_managed_sandbox = None
     if agent_store is not None and agent_id is not None:
         agent_name = await asyncio.to_thread(
             resolve_managed_agent_label,
@@ -2910,6 +2912,13 @@ async def _run_managed_launch(
         )
         agent_credential_providers = await asyncio.to_thread(
             resolve_agent_credential_providers,
+            agent_store,
+            agent_cache,
+            agent_id,
+            session_id=session_id,
+        )
+        agent_managed_sandbox = await asyncio.to_thread(
+            resolve_agent_managed_sandbox,
             agent_store,
             agent_cache,
             agent_id,
@@ -2926,6 +2935,7 @@ async def _run_managed_launch(
         provider=provider,
         agent_name=agent_name,
         agent_credential_providers=agent_credential_providers,
+        agent_managed_sandbox=agent_managed_sandbox,
         requested_credential_providers=requested_credential_providers,
     )
     if managed is None:
