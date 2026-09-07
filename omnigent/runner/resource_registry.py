@@ -189,7 +189,11 @@ def trim_terminal_output(text: str | None) -> str | None:
     return "\n".join(lines)
 
 
-#: An option NAME, allowlisted. Emphatically not "starts with a dash": a VALUE
+#: An option NAME, allowlisted, and deliberately NARROW: lowercase words of at
+#: most 12 characters joined by single hyphens. Real flags look like this;
+#: `secrets.token_urlsafe()` and urlsafe base64 do not (they carry uppercase,
+#: `_`, `=`, or runs longer than 12). Paired with the position rule below.
+#: Emphatically not "starts with a dash": a VALUE
 #: can start with one too, and a first-character test leaked every one of these
 #: verbatim — `-kJ8sSecretToken` (about 1 in 64 `secrets.token_urlsafe()`
 #: results begins with `-`), `-phunter2` (mysql/curl-style bundled short
@@ -197,7 +201,7 @@ def trim_terminal_output(text: str | None) -> str | None:
 #: that is not recognisably an option name is redacted, so a bundled short
 #: option like `-v3` is redacted too — correct, because it is indistinguishable
 #: from `-p<password>`.
-_OPTION_NAME_RE = re.compile(r"^(?:--[A-Za-z][A-Za-z0-9._-]{0,63}|-[A-Za-z])$")
+_OPTION_NAME_RE = re.compile(r"^(?:--[a-z]{1,12}(?:-[a-z0-9]{1,12}){0,5}|-[a-zA-Z])$")
 
 
 def redact_argv(args: list[object]) -> tuple[str, ...]:
@@ -218,15 +222,30 @@ def redact_argv(args: list[object]) -> tuple[str, ...]:
     :returns: Redacted tokens, safe to log.
     """
     out: list[str] = []
+    expect_value = False
     for raw in args:
         try:
             token = raw if isinstance(raw, str) else str(raw)
-        except Exception:  # noqa: BLE001 - a hostile __str__ must not break the report
+            name, sep, _value = token.partition("=")
+            is_name = bool(_OPTION_NAME_RE.fullmatch(name))
+        except Exception:  # noqa: BLE001 - a hostile token must not break the report
             out.append("<redacted>")
+            expect_value = False
             continue
-        name, sep, _value = token.partition("=")
-        if _OPTION_NAME_RE.match(name):
-            out.append(f"{name}=<redacted>" if sep else name)
+        # POSITION-AWARE. A pattern alone cannot separate a name from a value:
+        # `--sk-live-abcdef123456789` is a perfectly well-formed option name, and
+        # `secrets.token_urlsafe()` produces such strings. But a value always
+        # FOLLOWS its flag, so position decides it. The cost is that a boolean
+        # flag immediately after another flag is redacted too — accepted, because
+        # over-redaction loses a word and under-redaction loses a credential.
+        if expect_value:
+            out.append("<redacted>")
+            expect_value = False
+        elif is_name and sep:
+            out.append(f"{name}=<redacted>")   # inline value; nothing follows
+        elif is_name:
+            out.append(name)
+            expect_value = True
         else:
             out.append("<redacted>")
     return tuple(out)
