@@ -200,6 +200,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.disk_size_gb: int | None = None
         self.cpus: int | None = None
         self.memory_mib: int | None = None
+        self.agent_resources: dict[str, dict[str, int]] | None = None
         self.base_url: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
@@ -428,6 +429,7 @@ def install_fake_boxlite_launcher(
         disk_size_gb: int | None = None,
         cpus: int | None = None,
         memory_mib: int | None = None,
+        agent_resources: dict[str, dict[str, int]] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.endpoint = endpoint
@@ -438,6 +440,7 @@ def install_fake_boxlite_launcher(
         fake.disk_size_gb = disk_size_gb
         fake.cpus = cpus
         fake.memory_mib = memory_mib
+        fake.agent_resources = agent_resources
         return fake
 
     monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)

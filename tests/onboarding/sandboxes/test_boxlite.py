@@ -782,3 +782,33 @@ def test_run_tolerates_unavailable_streams(fake_boxlite: _FakeBoxliteState) -> N
     box.exec_queue.append((0, [], []))
     result = launcher.run(box_id, "true")
     assert result.returncode == 0
+
+
+def test_resources_for_prefers_the_agent_override() -> None:
+    """A per-agent entry wins over the server-wide value."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"cpus": 8, "memory_mib": 12288}}
+    )
+    assert launcher._resources_for("tester") == (8, 12288)
+
+
+def test_resources_for_falls_back_field_by_field() -> None:
+    """An override may set one field; the other keeps the server-wide value."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    )
+    assert launcher._resources_for("tester") == (2, 12288)
+
+
+def test_resources_for_unknown_or_missing_agent_uses_the_server_wide_value() -> None:
+    """Adding an agent must never require touching the override map."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"cpus": 8}}
+    )
+    assert launcher._resources_for("someone-else") == (2, 4096)
+    assert launcher._resources_for(None) == (2, 4096)
+
+
+def test_boxlite_declares_it_sizes_sandboxes_by_agent() -> None:
+    """The managed path only threads agent_name when this is declared."""
+    assert BoxliteSandboxLauncher().capabilities.sizes_sandbox_by_agent is True
