@@ -977,6 +977,34 @@ class TerminalInstance:
         text = _strip_ansi(snapshot).strip()
         return text or None
 
+    def capture_dead_pane_sync(self) -> str | None:
+        """Best-effort capture of a pane whose process has already exited.
+
+        :meth:`last_pane_text` only returns what a read or a watcher poll
+        happened to store, so a process that dies faster than the first poll
+        leaves no snapshot at all and its final frame — usually the one line
+        saying why it exited — is lost. A pi launch died in about a second and
+        reported ``Last captured terminal output: unavailable``; the actual
+        message was ``Error: Unknown option: --dangerously-skip-permissions``,
+        and recovering it took five separate investigations.
+
+        ``remain-on-exit`` keeps the tmux server alive past the inner CLI, so
+        ``capture-pane`` still succeeds against a dead pane (see
+        :meth:`_pane_is_dead`). This asks for that frame on the diagnostic path
+        rather than assuming someone already polled for it.
+
+        Synchronous and exception-free: it runs while a failure is being
+        reported, so it must never raise or block that report.
+
+        :returns: The pane text, or ``None`` when tmux is gone or the pane is
+            empty.
+        """
+        try:
+            out = self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p")
+        except Exception:
+            return None
+        return out or None
+
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
