@@ -254,6 +254,25 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_last_output, str):
                 last_output = trim_terminal_output(raw_last_output)
 
+    # The remembered snapshot is only whatever a read or watcher poll happened
+    # to store, so a terminal that dies faster than the first poll has none —
+    # and its final frame is exactly the line that says why it exited. Ask tmux
+    # for the dead pane directly before giving up; remain-on-exit keeps it
+    # capturable. Best-effort: this runs while a failure is being reported.
+    if last_output is None:
+        capture_dead = getattr(instance, "capture_dead_pane_sync", None)
+        if callable(capture_dead):
+            try:
+                raw_dead = capture_dead()
+            except Exception:
+                _logger.exception(
+                    "Failed to capture the dead pane for diagnostics",
+                    extra={"session_id": runner_primary_session_id()},
+                )
+            else:
+                if isinstance(raw_dead, str):
+                    last_output = trim_terminal_output(raw_dead) or None
+
     exit_status: int | None = None
     read_exit_status = getattr(instance, "last_exit_status", None)
     if callable(read_exit_status):
