@@ -4342,3 +4342,115 @@ def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
     spec = parse(tmp_path)
 
     assert spec.executor.reasoning_effort is None
+
+
+# ---------------------------------------------------------------------------
+# managed_sandbox.boxlite — image and env narrowing (FSXC-859)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_managed_sandbox_boxlite_image_and_env(tmp_path: Path) -> None:
+    """``managed_sandbox.boxlite`` parses image and env into the spec's dataclass.
+
+    What breaks if this fails: an agent cannot narrow the image it boots
+    or the credentials it receives, so every box on a server keeps
+    carrying every other engine's secrets.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "engine-a",
+        "managed_sandbox": {
+            "boxlite": {"image": " ghcr.io/acme/box:1 ", "env": ["A_KEY", " B_KEY "]}
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.managed_sandbox is not None
+    assert spec.managed_sandbox.boxlite is not None
+    assert spec.managed_sandbox.boxlite.image == "ghcr.io/acme/box:1"
+    assert spec.managed_sandbox.boxlite.env == ("A_KEY", "B_KEY")
+
+
+def test_parse_managed_sandbox_boxlite_empty_env_survives(tmp_path: Path) -> None:
+    """``env: []`` must parse as "inject nothing", NOT as absent.
+
+    What breaks if this fails: the strongest narrowing an agent can ask
+    for silently becomes the weakest — an empty list would collapse to
+    ``None`` and hand back the deployment's full credential set.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "no-creds",
+        "managed_sandbox": {"boxlite": {"env": []}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.managed_sandbox is not None
+    assert spec.managed_sandbox.boxlite is not None
+    assert spec.managed_sandbox.boxlite.env == ()
+
+
+def test_parse_managed_sandbox_boxlite_only_block_is_not_dropped(tmp_path: Path) -> None:
+    """A block naming only ``boxlite`` survives parsing.
+
+    What breaks if this fails: consulting one backend and returning
+    early drops a block that declared only the other — the exact
+    silent-ignore that keying this block by backend exists to prevent.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "boxlite-only",
+        "managed_sandbox": {"boxlite": {"image": "ghcr.io/acme/box:1"}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.managed_sandbox is not None
+    assert spec.managed_sandbox.boxlite is not None
+    assert spec.managed_sandbox.openshell is None
+
+
+def test_parse_managed_sandbox_both_backends_coexist(tmp_path: Path) -> None:
+    """Declaring both backends keeps both, so neither shadows the other."""
+    config = {
+        "spec_version": 1,
+        "name": "both",
+        "managed_sandbox": {
+            "openshell": {"providers": ["gitlab-readonly"]},
+            "boxlite": {"env": ["A_KEY"]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.managed_sandbox is not None
+    assert spec.managed_sandbox.openshell is not None
+    assert spec.managed_sandbox.openshell.providers == ("gitlab-readonly",)
+    assert spec.managed_sandbox.boxlite is not None
+    assert spec.managed_sandbox.boxlite.env == ("A_KEY",)
+
+
+def test_parse_managed_sandbox_boxlite_malformed_env_raises(tmp_path: Path) -> None:
+    """A non-list or blank env name is rejected at spec-load, not at launch.
+
+    What breaks if this fails: a typo'd override surfaces as a confusing
+    failure while a box is already booting.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "bad-env",
+        "managed_sandbox": {"boxlite": {"env": ["OK", ""]}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"managed_sandbox.boxlite.env"):
+        parse(tmp_path)
+
+
+def test_parse_managed_sandbox_boxlite_blank_image_raises(tmp_path: Path) -> None:
+    """A blank image is rejected rather than silently meaning "no override"."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-image",
+        "managed_sandbox": {"boxlite": {"image": "   "}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"managed_sandbox.boxlite.image"):
+        parse(tmp_path)

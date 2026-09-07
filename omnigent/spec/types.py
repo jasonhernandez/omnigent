@@ -1430,6 +1430,30 @@ class ManagedSandboxOpenShellSpec:
 
 
 @dataclass(frozen=True)
+class ManagedSandboxBoxliteSpec:
+    """The BoxLite slice of an agent's ``managed_sandbox:`` block.
+
+    Both fields NARROW what the deployment already offers; neither can
+    widen it. A server offers one configuration per provider, so without
+    this every box it launches boots the same image and receives the same
+    injected credential set whichever agent runs in it.
+
+    :param image: Registry image reference the box boots, replacing
+        ``sandbox.boxlite.image`` for this agent's launches. ``None``
+        keeps the deployment's own image.
+    :param env: Server-process environment variable NAMES to inject —
+        a **filter over** ``sandbox.boxlite.env``, never a free list. An
+        agent naming a variable the deployment does not offer fails the
+        launch rather than making the server read that variable out of
+        its own process. ``()`` injects nothing; ``None`` keeps the
+        deployment's own list.
+    """
+
+    image: str | None = None
+    env: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
 class ManagedSandboxSpec:
     """
     Top-level ``managed_sandbox:`` block: what the agent needs from the REMOTE
@@ -1443,9 +1467,12 @@ class ManagedSandboxSpec:
 
     :param openshell: The ``managed_sandbox.openshell:`` sub-block, or ``None``
         when the agent declares nothing for that backend.
+    :param boxlite: The ``managed_sandbox.boxlite:`` sub-block, or ``None``
+        when the agent declares nothing for that backend.
     """
 
     openshell: ManagedSandboxOpenShellSpec | None = None
+    boxlite: ManagedSandboxBoxliteSpec | None = None
 
 
 @dataclass

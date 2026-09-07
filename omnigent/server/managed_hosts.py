@@ -178,6 +178,7 @@ from omnigent.stores.host_store import Host, HostStore
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
     from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.spec.types import ManagedSandboxSpec
     from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -378,6 +379,63 @@ def resolve_agent_credential_providers(
         providers,
     )
     return providers
+
+
+def resolve_agent_managed_sandbox(
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+    agent_id: str | None,
+    *,
+    session_id: str,
+) -> ManagedSandboxSpec | None:
+    """
+    Resolve the whole ``managed_sandbox:`` block an agent's spec declares.
+
+    Same built-in gate as :func:`resolve_agent_credential_providers`, and
+    for the same reason: ``image`` names the code the box boots, so
+    honouring it from a user-uploaded bundle would let any caller run
+    arbitrary code on the operator's sandbox backend alongside whatever
+    credentials that provider injects.
+
+    A failure to READ a built-in's spec is deliberately NOT degraded to
+    "no block". The narrowing direction makes silence dangerous in a way
+    it is not for a runner classifier: falling back hands the launch the
+    deployment's FULL credential set, which is the precise outcome the
+    declaring agent was trying to avoid. Callers surface the raise, as
+    they already do for credential providers.
+
+    :param agent_store: Store to resolve the agent record from.
+    :param agent_cache: Cache the agent's bundle is loaded through, or
+        ``None`` (a stripped wiring) to skip the lookup entirely.
+    :param agent_id: The session's bound agent id, or ``None``.
+    :param session_id: Session id, for log correlation only.
+    :returns: The declared block, or ``None`` when the agent declares
+        none / is not a built-in / cannot be resolved.
+    """
+    if agent_cache is None or agent_id is None:
+        return None
+    agent = agent_store.get(agent_id)
+    if agent is None:
+        return None
+    if agent.session_id is not None or agent.id != builtin_agent_id(agent.name):
+        _logger.info(
+            "session %s: agent %r (%s) is not a genuine built-in; ignoring any "
+            "managed_sandbox block it declares",
+            session_id,
+            agent.name,
+            agent.id,
+        )
+        return None
+    loaded = agent_cache.load(agent.id, agent.bundle_location, expand_env=True)
+    managed_sandbox = getattr(loaded.spec, "managed_sandbox", None)
+    if managed_sandbox is None:
+        return None
+    _logger.info(
+        "session %s: agent %r declares a managed_sandbox block",
+        session_id,
+        agent.name,
+    )
+    return managed_sandbox
 
 
 def _bind_credential_providers(
@@ -673,6 +731,170 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    #: The raw ``sandbox`` mapping this config was parsed from, retained so
+    #: :meth:`for_agent` can re-run the provider parser over a narrowed copy
+    #: instead of rebuilding a launcher by hand. ``None`` for a config an
+    #: embedding deployment constructed directly, which therefore cannot be
+    #: narrowed (there is nothing to re-parse, and no operator-declared offer
+    #: to check a request against).
+    raw_config: dict[str, object] | None = None
+
+    def for_agent(self, override: ManagedSandboxSpec | None) -> ManagedSandboxConfig:
+        """
+        Narrow this provider config with one agent's ``managed_sandbox:`` block.
+
+        A server offers ONE configuration per provider, so every box it
+        launches otherwise boots the same image and receives the same
+        injected credential set whichever agent runs in it. This applies
+        an agent's declared narrowing to a single launch, leaving the
+        deployment's own config untouched.
+
+        Implemented by folding the override into the raw ``sandbox``
+        mapping and re-running :func:`_parse_single_provider_sandbox_config`,
+        NOT by rebuilding the launcher factory by hand. That is the whole
+        reason :attr:`raw_config` is retained: the re-parse puts the
+        override through every check the operator's own config passes —
+        ``_reject_unknown_keys``, the per-field type and shape validation,
+        the provider's mode rules — so an override cannot reach a
+        launcher by a path the server config could not.
+
+        ``env`` is a **filter, not a free list** (see
+        :func:`_narrow_agent_env`). ``image`` has no subset relation, so
+        it is trusted only because the caller resolving this block has
+        already gated it to genuine built-ins, exactly as
+        ``resolve_agent_credential_providers`` does.
+
+        :param override: The agent's parsed ``managed_sandbox:`` block, or
+            ``None`` for none — which returns ``self`` unchanged, so an
+            agent without the block launches byte-identically to before
+            this knob existed.
+        :returns: ``self`` when there is nothing to narrow, else a new
+            config whose launcher factory carries the narrowed values.
+        :raises HTTPException: 400 when the agent declares a block for a
+            provider that cannot honour it, or when the config was
+            constructed directly (no :attr:`raw_config` to re-parse), or
+            when ``env`` names a variable the server does not offer.
+        """
+        if override is None:
+            return self
+        # Which narrowing sub-blocks did the agent actually declare? Only
+        # backends in _AGENT_OVERRIDABLE_FIELDS narrow; `openshell.providers`
+        # is a capability GRANT resolved elsewhere, and is not consulted here.
+        declared = [
+            backend
+            for backend in _AGENT_OVERRIDABLE_FIELDS
+            if (sub := getattr(override, backend, None)) is not None
+            and not (sub.image is None and sub.env is None)
+        ]
+        if not declared:
+            return self
+        provider = self.provider or ""
+        sub = getattr(override, provider, None) if provider else None
+        fields = _AGENT_OVERRIDABLE_FIELDS.get(provider)
+        if sub is None or fields is None or (sub.image is None and sub.env is None):
+            # The agent asked to narrow, and this provider is not one it named.
+            # Proceeding would hand the launch the deployment's FULL image and
+            # credential set — more than the agent asked for, and precisely the
+            # outcome it declared the block to avoid. Narrowing that silently
+            # does not apply is worse than a refused launch, so refuse.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"agent declares managed_sandbox narrowing for "
+                    f"{', '.join(declared)}, which cannot be honoured by sandbox "
+                    f"provider '{provider or 'unknown'}' — refusing rather than "
+                    f"launching with the deployment's full image and credentials"
+                ),
+            )
+        if self.raw_config is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "per-agent sandbox narrowing needs a YAML-configured sandbox "
+                    "provider; this deployment supplies its launcher directly"
+                ),
+            )
+        block_key, image_key, env_key = fields
+        block_raw = self.raw_config.get(block_key)
+        block = dict(block_raw) if isinstance(block_raw, dict) else {}
+        if sub.image is not None:
+            block[image_key] = sub.image
+        if sub.env is not None:
+            block[env_key] = _narrow_agent_env(
+                sub.env, block.get(env_key), f"sandbox.{block_key}.{env_key}"
+            )
+        merged = dict(self.raw_config)
+        merged[block_key] = block
+        return _parse_single_provider_sandbox_config(merged)
+
+
+#: Which ``sandbox.<provider>`` block a ``managed_sandbox.<backend>`` override
+#: writes into, and what that provider spells its image and env fields:
+#: ``backend -> (config block, image field, env field)``.
+#:
+#: Only backends that declare a sub-block on :class:`ManagedSandboxSpec` can
+#: appear here — the surface is deliberately explicit per backend, because
+#: ``image`` and ``env`` do not mean the same thing to every provider (E2B
+#: boots a pre-built *template*, Modal calls its injected names *secrets*), and
+#: a flat block could not say which backend a key was written for.
+#:
+#: A provider absent from this table rejects an override at launch rather than
+#: ignoring it: silently booting the deployment's own image and full credential
+#: set is precisely the outcome an agent declaring this block is trying to
+#: avoid.
+_AGENT_OVERRIDABLE_FIELDS: dict[str, tuple[str, str, str]] = {
+    "boxlite": ("boxlite", "image", "env"),
+}
+
+
+def _narrow_agent_env(
+    requested: tuple[str, ...],
+    offered: object,
+    path: str,
+) -> list[str]:
+    """
+    Resolve one agent's requested credential names against the offered set.
+
+    The agent-facing half of the ``env`` contract: an agent may ask for
+    FEWER of the variables its server injects, never for one the server
+    does not inject. That direction is the point of the feature — a box
+    running engine A must not carry engine B's credentials — and the
+    reverse must be impossible, because the server resolves these names
+    against its OWN process environment. An agent that could name an
+    arbitrary variable could read anything the server holds, whether or
+    not the operator meant to expose it.
+
+    Requesting nothing (``()``) is always allowed: the empty set is a
+    subset of every set, including the "not configured" case, and it is
+    the strongest narrowing an agent can ask for.
+
+    :param requested: The agent's ``managed_sandbox.<backend>.env`` names,
+        already shape-validated at spec-load time.
+    :param offered: The provider block's configured value — a list of
+        names, or ``None``/absent when the operator configured none.
+    :param path: Config path used in the error, e.g. ``"sandbox.boxlite.env"``.
+    :returns: The requested names, in the order the agent listed them.
+    :raises HTTPException: 400 when a requested name is not offered.
+    """
+    if not requested:
+        return []
+    offered_names = (
+        {name for name in offered if isinstance(name, str)}
+        if isinstance(offered, list)
+        else set()
+    )
+    unoffered = sorted(set(requested) - offered_names)
+    if unoffered:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"agent's managed_sandbox env may only narrow '{path}', not extend "
+                f"it: {', '.join(unoffered)} "
+                f"{'is' if len(unoffered) == 1 else 'are'} not offered by this server "
+                f"(offered: {', '.join(sorted(offered_names)) or 'none'})"
+            ),
+        )
+    return list(requested)
 
 
 @dataclass(frozen=True)
@@ -1579,6 +1801,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         ),
         provider=provider,
         host_config=host_config,
+        raw_config=dict(raw),
     )
 
 
@@ -3164,6 +3387,7 @@ async def launch_managed_host(
     provider: str | None = None,
     agent_name: str | None = None,
     agent_credential_providers: Sequence[str] | None = None,
+    agent_managed_sandbox: ManagedSandboxSpec | None = None,
     requested_credential_providers: Sequence[str] | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
@@ -3219,7 +3443,9 @@ async def launch_managed_host(
         selected provider lacks managed-launch support; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
-    entry = _select_provider_config(config, provider)
+    # FSXC-859: narrow the deployment's provider config with whatever this
+    # agent declared, before anything is provisioned from it.
+    entry = _select_provider_config(config, provider).for_agent(agent_managed_sandbox)
     launcher = entry.launcher_factory()
     _bind_credential_providers(
         launcher,
@@ -3262,6 +3488,7 @@ async def relaunch_managed_host(
     repo: RepoWorkspace | None = None,
     agent_name: str | None = None,
     agent_credential_providers: Sequence[str] | None = None,
+    agent_managed_sandbox: ManagedSandboxSpec | None = None,
     requested_credential_providers: Sequence[str] | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
@@ -3322,7 +3549,7 @@ async def relaunch_managed_host(
     )
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
-    entry = config.recorded(host.sandbox_provider)
+    entry = config.recorded(host.sandbox_provider).for_agent(agent_managed_sandbox)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
@@ -3716,6 +3943,7 @@ async def resume_managed_host(
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
+    agent_managed_sandbox: ManagedSandboxSpec | None = None,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -3779,7 +4007,10 @@ async def resume_managed_host(
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
-        entry = config.recorded(host.sandbox_provider)
+        # A wake re-execs `omnigent host`, so without narrowing here the box
+        # would be handed the deployment's full credential set again on its
+        # first idle-stop — undoing at resume exactly what launch narrowed.
+        entry = config.recorded(host.sandbox_provider).for_agent(agent_managed_sandbox)
         sandbox_id = host.sandbox_id
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",
