@@ -499,6 +499,52 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.disk_size_gb is None
 
 
+def test_parse_boxlite_agent_resources_reach_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-agent overrides reach the launcher; either field may stand alone."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://s.example.com",
+            "boxlite": {
+                "memory_mib": 4096,
+                "agent_resources": {
+                    "reviewer": {"cpus": 2, "memory_mib": 2048},
+                    "tester": {"memory_mib": 12288},
+                },
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.agent_resources == {
+        "reviewer": {"cpus": 2, "memory_mib": 2048},
+        "tester": {"memory_mib": 12288},
+    }
+
+
+@pytest.mark.parametrize(
+    ("bad", "expected"),
+    [
+        ({"agent_resources": []}, "sandbox.boxlite.agent_resources"),
+        ({"agent_resources": {"a": 3}}, "sandbox.boxlite.agent_resources.a"),
+        ({"agent_resources": {"a": {"ram": 1}}}, "unknown key"),
+        ({"agent_resources": {"a": {"cpus": 0}}}, "sandbox.boxlite.agent_resources.a.cpus"),
+        ({"agent_resources": {"a": {"cpus": True}}}, "sandbox.boxlite.agent_resources.a.cpus"),
+    ],
+)
+def test_parse_boxlite_agent_resources_fail_loud(bad: dict, expected: str) -> None:
+    """A malformed override names the exact agent and field that is wrong."""
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        parse_sandbox_config(
+            {"provider": "boxlite", "server_url": "https://s.example.com", "boxlite": bad}
+        )
+
+
 def test_parse_boxlite_resources_reach_launcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
