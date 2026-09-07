@@ -812,3 +812,44 @@ def test_resources_for_unknown_or_missing_agent_uses_the_server_wide_value() -> 
 def test_boxlite_declares_it_sizes_sandboxes_by_agent() -> None:
     """The managed path only threads agent_name when this is declared."""
     assert BoxliteSandboxLauncher().capabilities.sizes_sandbox_by_agent is True
+
+
+def test_provision_cpus_and_memory_reach_box_options(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """The passthrough itself. Gutting it left all 862 tests passing.
+
+    The suite covered config->constructor and `_resources_for()` in isolation,
+    but nothing asserted the values reach `BoxOptions` — so reverting
+    `provision()` to the old hardcoded constants broke nothing. Mirrors
+    test_provision_disk_size_gb_reaches_box_options.
+    """
+    BoxliteSandboxLauncher(cpus=4, memory_mib=8192).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.cpus == 4
+    assert create.options.memory_mib == 8192
+
+
+def test_provision_sizes_the_box_for_the_named_agent(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """The per-agent override must reach BoxOptions, not just _resources_for."""
+    BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    ).provision("managed-abc", agent_name="tester")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.memory_mib == 12288
+    assert create.options.cpus == 2  # falls back field-by-field
+
+
+def test_provision_unknown_agent_gets_the_server_wide_size(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    ).provision("managed-abc", agent_name="someone-else")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.memory_mib == 4096
