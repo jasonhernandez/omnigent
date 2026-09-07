@@ -7,6 +7,7 @@ with optional filesystem isolation (fork) and sandboxing (bwrap/seccomp).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import logging
 import os
@@ -19,7 +20,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import ClassVar, Any, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
@@ -977,6 +978,9 @@ class TerminalInstance:
         text = _strip_ansi(snapshot).strip()
         return text or None
 
+    #: Seconds to wait for a dead pane's final frame before giving up.
+    _DEAD_PANE_CAPTURE_TIMEOUT_S: ClassVar[float] = 5.0
+
     def capture_dead_pane_sync(self) -> str | None:
         """Best-effort capture of a pane whose process has already exited.
 
@@ -999,8 +1003,17 @@ class TerminalInstance:
         :returns: The pane text, or ``None`` when tmux is gone or the pane is
             empty.
         """
+        # BOUNDED. `_tmux_output_sync` calls `subprocess.run` with no timeout,
+        # and every other caller is the daemon watcher thread. This one runs
+        # from `_handle_terminal_exit`, which is scheduled on the runner's event
+        # loop — so before this bound, a wedged tmux server could stall the
+        # whole runner while trying to report a failure. A diagnostic must never
+        # cost more than the diagnosis is worth.
         try:
-            out = self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                out = pool.submit(
+                    self._tmux_output_sync, "capture-pane", "-t", self.tmux_target, "-p"
+                ).result(timeout=self._DEAD_PANE_CAPTURE_TIMEOUT_S)
         except Exception:
             return None
         return out or None
