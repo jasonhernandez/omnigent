@@ -890,6 +890,44 @@ def test_redact_argv_never_emits_a_secret_substring(secret: str) -> None:
     assert secret not in rendered
 
 
+def test_redact_argv_never_leaks_a_generated_secret() -> None:
+    """Generative, because an enumerated list certifies only what it lists.
+
+    Round 1's test conceded the leak in its own assertion. Round 2's asserted
+    the contract but enumerated eight inputs, none of which was `--` followed by
+    a letter — precisely the shape that still leaked, at a measured 81% for
+    double-dash tokens. A generator finds that class in under a second.
+    """
+    import base64
+    import secrets
+
+    for _ in range(2000):
+        for secret in (
+            secrets.token_urlsafe(32),
+            "--" + secrets.token_urlsafe(24),
+            base64.urlsafe_b64encode(secrets.token_bytes(24)).decode(),
+            "--" + secrets.token_hex(16),
+        ):
+            # Both an option-value position and a bare position.
+            rendered = " ".join(redact_argv(["--api-key", secret, secret, "--f", secret]))
+            assert secret not in rendered, f"leaked {secret!r} -> {rendered!r}"
+
+
+def test_redact_argv_keeps_real_flag_names_readable() -> None:
+    """Over-redaction has a cost too: the diagnostic must stay useful.
+
+    `--dangerously-skip-permissions` is the flag whose presence identified the
+    pi failure; if the redaction hid it, the feature would have no point.
+    """
+    rendered = redact_argv(
+        ["--extension", "/root/x.js", "--approve", "--session-dir", "/root/s",
+         "--dangerously-skip-permissions"]
+    )
+    assert "--dangerously-skip-permissions" in rendered
+    assert "--extension" in rendered
+    assert "/root/x.js" not in " ".join(rendered)
+
+
 def test_redact_argv_stringifies_non_string_tokens() -> None:
     """A non-str token is still redacted rather than crashing the formatter."""
     assert redact_argv([1, None]) == ("<redacted>", "<redacted>")
