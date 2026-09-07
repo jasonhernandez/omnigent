@@ -3080,6 +3080,11 @@ def create_runner_app(
         if event.args_count is None or event.args_count == 0:
             return event.command
         noun = "arg" if event.args_count == 1 else "args"
+        if event.args_redacted:
+            # Option names, values redacted. A runtime that dies on its own
+            # command line is otherwise undiagnosable: the count alone cannot
+            # distinguish "wrong flag" from "missing credential".
+            return f"{event.command} {' '.join(event.args_redacted)}  ({event.args_count} {noun}, values redacted)"
         return (
             f"{event.command} ({event.args_count} {noun}; "
             "argv omitted because terminal args may contain secrets)"

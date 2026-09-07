@@ -3125,7 +3125,10 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
     inbox_item = parent_inbox.get_nowait()
     assert inbox_item["status"] == "failed"
     assert "Required terminal exited unexpectedly" in inbox_item["output"]
-    assert "command: worker-cli (2 args; argv omitted" in inbox_item["output"]
+    # Argv is now shown with option names kept and every value redacted, so a
+    # launch failure is diagnosable without printing a single value.
+    assert "command: worker-cli" in inbox_item["output"]
+    assert "(2 args, values redacted)" in inbox_item["output"]
     assert f"cwd: {tmp_path}" in inbox_item["output"]
     assert "startup failed\ncomplete setup first" in inbox_item["output"]
     assert "Suggested next checks" not in inbox_item["output"]

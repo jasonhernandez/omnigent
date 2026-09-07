@@ -25,6 +25,7 @@ from omnigent.runner.resource_registry import (
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
+    redact_argv,
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
@@ -783,6 +784,34 @@ def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
 
+def test_redact_argv_keeps_option_names_and_drops_every_value() -> None:
+    """Option names survive; operands and inline values do not."""
+    assert redact_argv(
+        ["--model", "qwen-token-plan/qwen3.8-flash", "--ext", "/root/x.js", "-v", "positional"]
+    ) == ("--model", "<redacted>", "--ext", "<redacted>", "-v", "<redacted>")
+
+
+def test_redact_argv_redacts_inline_option_values() -> None:
+    """``--token=SECRET`` keeps the name and loses the value."""
+    assert redact_argv(["--token=SECRET"]) == ("--token=<redacted>",)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ["sk-live-abcdef123456", "ghp_deadbeef", "--token=sk-live-abcdef123456", "hunter2"],
+)
+def test_redact_argv_never_emits_a_secret_substring(secret: str) -> None:
+    """The whole point: no argv VALUE may survive into a log line."""
+    rendered = " ".join(redact_argv(["--flag", secret, secret]))
+    leaked = secret.split("=", 1)[1] if secret.startswith("-") and "=" in secret else secret
+    assert leaked not in rendered
+
+
+def test_redact_argv_stringifies_non_string_tokens() -> None:
+    """A non-str token is still redacted rather than crashing the formatter."""
+    assert redact_argv([1, None]) == ("<redacted>", "<redacted>")
+
+
 def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     instance.command = "claude"
@@ -790,9 +819,13 @@ def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
     instance._remember_pane_snapshot("boom")
     # Simulate tmux having reported a dead pane with a captured status.
     instance._remember_exit_status("1 42")
-    command, args_count, _cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+    command, args_count, args_redacted, _cwd, last_output, exit_status = (
+        _terminal_exit_diagnostics(instance)
+    )
     assert command == "claude"
     assert args_count == 1
+    # Option names survive; there are no values here to redact.
+    assert args_redacted == ("--dangerously-skip-permissions",)
     assert last_output == "boom"
     assert exit_status == 42
 
