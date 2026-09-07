@@ -864,13 +864,30 @@ def test_redact_argv_redacts_inline_option_values() -> None:
 
 @pytest.mark.parametrize(
     "secret",
-    ["sk-live-abcdef123456", "ghp_deadbeef", "--token=sk-live-abcdef123456", "hunter2"],
+    [
+        "sk-live-abcdef123456",
+        "ghp_deadbeef",
+        "--token=sk-live-abcdef123456",
+        "hunter2",
+        # A VALUE may itself start with a dash. The original implementation
+        # classified tokens by first character and emitted all of these
+        # verbatim; the original test hid that by conceding the case in its own
+        # assertion instead of asserting the contract.
+        "-kJ8sSecretTokenValue_9x",  # ~1 in 64 secrets.token_urlsafe() start with -
+        "-phunter2",  # mysql/curl-style bundled short option
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-abcSECRETmaterial=",
+    ],
 )
 def test_redact_argv_never_emits_a_secret_substring(secret: str) -> None:
-    """The whole point: no argv VALUE may survive into a log line."""
+    """The whole point: no argv VALUE may survive into a log line.
+
+    Asserts the CONTRACT — the secret must not appear, in any form. It must not
+    concede shapes the implementation happens to mishandle, which is exactly how
+    the dash-prefixed leak survived a test named for catching it.
+    """
     rendered = " ".join(redact_argv(["--flag", secret, secret]))
-    leaked = secret.split("=", 1)[1] if secret.startswith("-") and "=" in secret else secret
-    assert leaked not in rendered
+    assert secret not in rendered
 
 
 def test_redact_argv_stringifies_non_string_tokens() -> None:
