@@ -19,7 +19,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import ClassVar, Any, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
@@ -977,6 +977,51 @@ class TerminalInstance:
         text = _strip_ansi(snapshot).strip()
         return text or None
 
+    #: Seconds to wait for a dead pane's final frame before giving up.
+    _DEAD_PANE_CAPTURE_TIMEOUT_S: ClassVar[float] = 5.0
+
+    def capture_dead_pane_sync(self) -> str | None:
+        """Best-effort capture of a pane whose process has already exited.
+
+        :meth:`last_pane_text` only returns what a read or a watcher poll
+        happened to store, so a process that dies faster than the first poll
+        leaves no snapshot at all and its final frame — usually the one line
+        saying why it exited — is lost. A pi launch died in about a second and
+        reported ``Last captured terminal output: unavailable``; the actual
+        message was ``Error: Unknown option: --dangerously-skip-permissions``,
+        and recovering it took five separate investigations.
+
+        ``remain-on-exit`` keeps the tmux server alive past the inner CLI, so
+        ``capture-pane`` still succeeds against a dead pane (see
+        :meth:`_pane_is_dead`). This asks for that frame on the diagnostic path
+        rather than assuming someone already polled for it.
+
+        Synchronous and exception-free: it runs while a failure is being
+        reported, so it must never raise or block that report.
+
+        :returns: The pane text, or ``None`` when tmux is gone or the pane is
+            empty.
+        """
+        # BOUNDED at the subprocess, which is the only place it can be bounded.
+        # An earlier attempt wrapped this in a ThreadPoolExecutor with a
+        # `.result(timeout=…)`; that is INERT, because `__exit__` calls
+        # `shutdown(wait=True)` and joins the wedged worker anyway — measured at
+        # 3.00s against a 0.5s "bound". Every other caller of
+        # `_tmux_output_sync` is the daemon watcher thread; this one runs from
+        # `_handle_terminal_exit` on the runner's event loop, so an unbounded
+        # wait stalls the whole runner while trying to report a failure.
+        try:
+            out = self._tmux_output_sync(
+                "capture-pane",
+                "-t",
+                self.tmux_target,
+                "-p",
+                timeout=self._DEAD_PANE_CAPTURE_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic must not break the report
+            return None
+        return out or None
+
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
@@ -1928,7 +1973,7 @@ class TerminalInstance:
             )
         return stdout.decode()
 
-    def _tmux_output_sync(self, *args: str) -> str:
+    def _tmux_output_sync(self, *args: str, timeout: float | None = None) -> str:
         """
         Synchronous sibling of :meth:`_tmux_output`.
 
@@ -1945,7 +1990,9 @@ class TerminalInstance:
         """
         cmd = [*self._tmux_base_cmd(), *args]
         try:
-            proc = subprocess.run(cmd, capture_output=True, check=False)
+            proc = subprocess.run(
+                cmd, capture_output=True, check=False, timeout=timeout
+            )
         except OSError as exc:
             raise RuntimeError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
         if proc.returncode != 0:

@@ -135,6 +135,9 @@ class TerminalExitEvent:
     :param args_count: Number of arguments passed to the executable, if known.
         The event intentionally does not expose argv contents because terminal
         specs may contain credentials or other launch-only secrets.
+    :param args_redacted: Argv with option names kept and every value replaced
+        by ``<redacted>`` — see :func:`redact_argv`. Preserves the original
+        no-values guarantee while making a launch failure diagnosable.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
     :param exit_status: The inner process's exit code, when tmux captured one
@@ -154,6 +157,7 @@ class TerminalExitEvent:
     lifecycle: TerminalLifecycle
     command: str | None = None
     args_count: int | None = None
+    args_redacted: tuple[str, ...] | None = None
     cwd: str | None = None
     last_output: str | None = None
     exit_status: int | None = None
@@ -185,21 +189,87 @@ def trim_terminal_output(text: str | None) -> str | None:
     return "\n".join(lines)
 
 
+#: An option NAME, allowlisted, and deliberately NARROW: lowercase words of at
+#: most 12 characters joined by single hyphens. Real flags look like this;
+#: `secrets.token_urlsafe()` and urlsafe base64 do not (they carry uppercase,
+#: `_`, `=`, or runs longer than 12). Paired with the position rule below.
+#: Emphatically not "starts with a dash": a VALUE
+#: can start with one too, and a first-character test leaked every one of these
+#: verbatim — `-kJ8sSecretToken` (about 1 in 64 `secrets.token_urlsafe()`
+#: results begins with `-`), `-phunter2` (mysql/curl-style bundled short
+#: option), and an entire `-----BEGIN OPENSSH PRIVATE KEY-----` blob. Anything
+#: that is not recognisably an option name is redacted, so a bundled short
+#: option like `-v3` is redacted too — correct, because it is indistinguishable
+#: from `-p<password>`.
+_OPTION_NAME_RE = re.compile(r"^(?:--[a-z]{1,12}(?:-[a-z0-9]{1,12}){0,5}|-[a-zA-Z])$")
+
+
+def redact_argv(args: list[object]) -> tuple[str, ...]:
+    """Render argv with option NAMES kept and every value redacted.
+
+    A terminal spec may carry credentials, so argv was withheld wholesale and
+    the failure said only how many arguments there were. That makes a harness
+    that dies on its own command line undiagnosable: three separate
+    investigations of a runtime exiting in ~1s were unable to see what it was
+    invoked with.
+
+    Secrets are values, essentially never option names. So an option keeps its
+    name, an inline ``--opt=value`` keeps only the name, and everything else
+    becomes ``<redacted>``. That is enough to see *shape* — which flags were
+    passed, how many operands — without printing a single value.
+
+    :param args: Raw argv tail (excluding the executable).
+    :returns: Redacted tokens, safe to log.
+    """
+    out: list[str] = []
+    expect_value = False
+    for raw in args:
+        try:
+            token = raw if isinstance(raw, str) else str(raw)
+            name, sep, _value = token.partition("=")
+            is_name = bool(_OPTION_NAME_RE.fullmatch(name))
+        except Exception:  # noqa: BLE001 - a hostile token must not break the report
+            out.append("<redacted>")
+            expect_value = False
+            continue
+        # POSITION-AWARE. A pattern alone cannot separate a name from a value:
+        # `--sk-live-abcdef123456789` is a perfectly well-formed option name, and
+        # `secrets.token_urlsafe()` produces such strings. But a value always
+        # FOLLOWS its flag, so position decides it. The cost is that a boolean
+        # flag immediately after another flag is redacted too — accepted, because
+        # over-redaction loses a word and under-redaction loses a credential.
+        if expect_value:
+            out.append("<redacted>")
+            expect_value = False
+        elif is_name and sep:
+            out.append(f"{name}=<redacted>")   # inline value; nothing follows
+        elif is_name:
+            out.append(name)
+            expect_value = True
+        else:
+            out.append("<redacted>")
+    return tuple(out)
+
+
 def _terminal_exit_diagnostics(
     instance: TerminalInstance | None,
-) -> tuple[str | None, int | None, str | None, str | None, int | None]:
+) -> tuple[
+    str | None, int | None, tuple[str, ...] | None, str | None, str | None, int | None
+]:
     """Extract generic launch/output diagnostics from a terminal instance.
 
-    :returns: ``(command, args_count, cwd, last_output, exit_status)``.
+    :returns: ``(command, args_count, args_redacted, cwd, last_output,
+        exit_status)``.
     """
     if instance is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     raw_command = getattr(instance, "command", None)
     command = raw_command if isinstance(raw_command, str) and raw_command else None
 
     raw_args = getattr(instance, "args", None)
     args_count = len(raw_args) if isinstance(raw_args, list) else None
+    args_redacted = redact_argv(raw_args) if isinstance(raw_args, list) else None
 
     raw_cwd = getattr(instance, "launch_cwd", None)
     cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
@@ -218,6 +288,25 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_last_output, str):
                 last_output = trim_terminal_output(raw_last_output)
 
+    # The remembered snapshot is only whatever a read or watcher poll happened
+    # to store, so a terminal that dies faster than the first poll has none —
+    # and its final frame is exactly the line that says why it exited. Ask tmux
+    # for the dead pane directly before giving up; remain-on-exit keeps it
+    # capturable. Best-effort: this runs while a failure is being reported.
+    if last_output is None:
+        capture_dead = getattr(instance, "capture_dead_pane_sync", None)
+        if callable(capture_dead):
+            try:
+                raw_dead = capture_dead()
+            except Exception:
+                _logger.exception(
+                    "Failed to capture the dead pane for diagnostics",
+                    extra={"session_id": runner_primary_session_id()},
+                )
+            else:
+                if isinstance(raw_dead, str):
+                    last_output = trim_terminal_output(raw_dead) or None
+
     exit_status: int | None = None
     read_exit_status = getattr(instance, "last_exit_status", None)
     if callable(read_exit_status):
@@ -232,7 +321,7 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_exit_status, int):
                 exit_status = raw_exit_status
 
-    return command, args_count, cwd, last_output, exit_status
+    return command, args_count, args_redacted, cwd, last_output, exit_status
 
 
 def _monotonic() -> float:
@@ -1435,7 +1524,9 @@ class SessionResourceRegistry:
             )
             lifecycle = observed
 
-        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        command, args_count, args_redacted, cwd, last_output, exit_status = (
+            _terminal_exit_diagnostics(instance)
+        )
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
@@ -1476,6 +1567,7 @@ class SessionResourceRegistry:
                     lifecycle=lifecycle,
                     command=command,
                     args_count=args_count,
+                    args_redacted=args_redacted,
                     cwd=cwd,
                     last_output=last_output,
                     exit_status=exit_status,

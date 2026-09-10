@@ -25,6 +25,7 @@ from omnigent.runner.resource_registry import (
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
+    redact_argv,
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
@@ -783,6 +784,155 @@ def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
 
+class _FakeExitedTerminal:
+    """Minimal stand-in for a terminal that has already exited."""
+
+    command = "/usr/local/bin/pi"
+    args = ["--extension", "/root/ext.js"]
+    launch_cwd = "/root/workspace"
+
+    def __init__(self, remembered=None, dead_capture=None, dead_raises=False):
+        self._remembered = remembered
+        self._dead_capture = dead_capture
+        self._dead_raises = dead_raises
+        self.dead_calls = 0
+
+    def last_pane_text(self):
+        return self._remembered
+
+    def last_exit_status(self):
+        return None
+
+    def capture_dead_pane_sync(self):
+        self.dead_calls += 1
+        if self._dead_raises:
+            raise RuntimeError("tmux gone")
+        return self._dead_capture
+
+
+def test_exit_diagnostics_captures_the_dead_pane_when_nothing_was_remembered() -> None:
+    """A process that dies before the first poll still reports its last frame."""
+    term = _FakeExitedTerminal(
+        remembered=None, dead_capture="Error: Unknown option: --dangerously-skip-permissions"
+    )
+    last_output = _terminal_exit_diagnostics(term)[4]
+    assert last_output == "Error: Unknown option: --dangerously-skip-permissions"
+    assert term.dead_calls == 1
+
+
+def test_exit_diagnostics_prefers_a_remembered_snapshot_over_a_late_capture() -> None:
+    """A real snapshot wins; the dead-pane probe is not even attempted."""
+    term = _FakeExitedTerminal(remembered="the real final frame", dead_capture="stale")
+    assert _terminal_exit_diagnostics(term)[4] == "the real final frame"
+    assert term.dead_calls == 0
+
+
+def test_exit_diagnostics_survives_a_failing_dead_pane_capture() -> None:
+    """This runs while a failure is being reported; it must never raise."""
+    term = _FakeExitedTerminal(remembered=None, dead_raises=True)
+    assert _terminal_exit_diagnostics(term)[4] is None
+
+
+def test_exit_diagnostics_tolerates_a_terminal_without_the_capture_method() -> None:
+    """An older/other terminal object simply reports no output, as before."""
+
+    class _Legacy:
+        command = "x"
+        args: list[str] = []
+        launch_cwd = None
+
+        def last_pane_text(self):
+            return None
+
+        def last_exit_status(self):
+            return None
+
+    assert _terminal_exit_diagnostics(_Legacy())[4] is None
+
+
+def test_redact_argv_keeps_option_names_and_drops_every_value() -> None:
+    """Option names survive; operands and inline values do not."""
+    assert redact_argv(
+        ["--model", "qwen-token-plan/qwen3.8-flash", "--ext", "/root/x.js", "-v", "positional"]
+    ) == ("--model", "<redacted>", "--ext", "<redacted>", "-v", "<redacted>")
+
+
+def test_redact_argv_redacts_inline_option_values() -> None:
+    """``--token=SECRET`` keeps the name and loses the value."""
+    assert redact_argv(["--token=SECRET"]) == ("--token=<redacted>",)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-live-abcdef123456",
+        "ghp_deadbeef",
+        "--token=sk-live-abcdef123456",
+        "hunter2",
+        # A VALUE may itself start with a dash. The original implementation
+        # classified tokens by first character and emitted all of these
+        # verbatim; the original test hid that by conceding the case in its own
+        # assertion instead of asserting the contract.
+        "-kJ8sSecretTokenValue_9x",  # ~1 in 64 secrets.token_urlsafe() start with -
+        "-phunter2",  # mysql/curl-style bundled short option
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-abcSECRETmaterial=",
+    ],
+)
+def test_redact_argv_never_emits_a_secret_substring(secret: str) -> None:
+    """The whole point: no argv VALUE may survive into a log line.
+
+    Asserts the CONTRACT — the secret must not appear, in any form. It must not
+    concede shapes the implementation happens to mishandle, which is exactly how
+    the dash-prefixed leak survived a test named for catching it.
+    """
+    rendered = " ".join(redact_argv(["--flag", secret, secret]))
+    assert secret not in rendered
+
+
+def test_redact_argv_never_leaks_a_generated_secret() -> None:
+    """Generative, because an enumerated list certifies only what it lists.
+
+    Round 1's test conceded the leak in its own assertion. Round 2's asserted
+    the contract but enumerated eight inputs, none of which was `--` followed by
+    a letter — precisely the shape that still leaked, at a measured 81% for
+    double-dash tokens. A generator finds that class in under a second.
+    """
+    import base64
+    import secrets
+
+    for _ in range(2000):
+        for secret in (
+            secrets.token_urlsafe(32),
+            "--" + secrets.token_urlsafe(24),
+            base64.urlsafe_b64encode(secrets.token_bytes(24)).decode(),
+            "--" + secrets.token_hex(16),
+        ):
+            # Both an option-value position and a bare position.
+            rendered = " ".join(redact_argv(["--api-key", secret, secret, "--f", secret]))
+            assert secret not in rendered, f"leaked {secret!r} -> {rendered!r}"
+
+
+def test_redact_argv_keeps_real_flag_names_readable() -> None:
+    """Over-redaction has a cost too: the diagnostic must stay useful.
+
+    `--dangerously-skip-permissions` is the flag whose presence identified the
+    pi failure; if the redaction hid it, the feature would have no point.
+    """
+    rendered = redact_argv(
+        ["--extension", "/root/x.js", "--approve", "--session-dir", "/root/s",
+         "--dangerously-skip-permissions"]
+    )
+    assert "--dangerously-skip-permissions" in rendered
+    assert "--extension" in rendered
+    assert "/root/x.js" not in " ".join(rendered)
+
+
+def test_redact_argv_stringifies_non_string_tokens() -> None:
+    """A non-str token is still redacted rather than crashing the formatter."""
+    assert redact_argv([1, None]) == ("<redacted>", "<redacted>")
+
+
 def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     instance.command = "claude"
@@ -790,9 +940,13 @@ def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
     instance._remember_pane_snapshot("boom")
     # Simulate tmux having reported a dead pane with a captured status.
     instance._remember_exit_status("1 42")
-    command, args_count, _cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+    command, args_count, args_redacted, _cwd, last_output, exit_status = (
+        _terminal_exit_diagnostics(instance)
+    )
     assert command == "claude"
     assert args_count == 1
+    # Option names survive; there are no values here to redact.
+    assert args_redacted == ("--dangerously-skip-permissions",)
     assert last_output == "boom"
     assert exit_status == 42
 
