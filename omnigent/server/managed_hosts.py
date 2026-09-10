@@ -1349,6 +1349,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             env=_parse_provider_env(raw, "openshell"),
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
             workspace=_parse_provider_string(raw, "openshell", "workspace"),
+            providers=_parse_provider_names(raw, "openshell"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider in ("kubernetes", "agent_sandbox"):
@@ -2113,6 +2114,7 @@ def _openshell_launcher_factory(
     env: list[str] | None,
     cluster: str | None,
     workspace: str | None,
+    providers: list[str] | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
@@ -2129,6 +2131,9 @@ def _openshell_launcher_factory(
     :param workspace: OpenShell workspace for sandbox lifecycle, or
         ``None`` to resolve from ``$OMNIGENT_OPENSHELL_WORKSPACE``
         then ``"default"``.
+    :param providers: Gateway provider records to attach to every
+        sandbox, e.g. ``["github-ci"]``, or ``None`` to resolve from
+        ``$OMNIGENT_OPENSHELL_PROVIDERS``.
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
@@ -2136,7 +2141,13 @@ def _openshell_launcher_factory(
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
-        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
+        return OpenShellSandboxLauncher(
+            image=image,
+            env=env,
+            cluster=cluster,
+            workspace=workspace,
+            providers=providers,
+        )
 
     return _build
 
@@ -2354,6 +2365,38 @@ def _parse_provider_env(raw: dict[str, object], provider: str) -> list[str] | No
             "'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _parse_provider_names(raw: dict[str, object], provider: str) -> list[str] | None:
+    """
+    Extract and validate the gateway provider records to attach.
+
+    Unlike ``env`` (server environment variable NAMES copied into the
+    sandbox as readable values), these name provider records held by the
+    gateway; their credentials reach the sandbox as placeholders the
+    gateway's proxy resolves per request.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"openshell"``.
+    :returns: Validated provider record names, or ``None`` when not
+        configured.
+    :raises ValueError: When the provider block or list is malformed.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    names = section.get("providers")
+    if names is None:
+        return None
+    if not isinstance(names, list) or not all(
+        isinstance(name, str) and name.strip() for name in names
+    ):
+        raise ValueError(
+            f"server config 'sandbox.{provider}.providers' must be a list of "
+            "OpenShell provider record NAMES to attach, e.g. ['github-ci', "
+            "'anthropic-prod']"
+        )
+    return [name.strip() for name in names]
 
 
 def _parse_provider_string(raw: dict[str, object], provider: str, key: str) -> str | None:
