@@ -39,6 +39,9 @@ from omnigent.spec.types import (
     LabelDef,
     LLMConfig,
     LocalToolInfo,
+    ManagedSandboxBoxliteSpec,
+    ManagedSandboxOpenShellSpec,
+    ManagedSandboxSpec,
     MCPServerConfig,
     ModalityConfig,
     Phase,
@@ -245,6 +248,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    managed_sandbox = _parse_managed_sandbox(raw.get("managed_sandbox"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -311,6 +315,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
+        managed_sandbox=managed_sandbox,
         terminals=terminals,
         timers=timers,
         spawn=spawn,
@@ -835,6 +840,144 @@ def _parse_os_env(
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
+    )
+
+
+# Sandbox backends that read the top-level ``managed_sandbox:`` block. Keyed by
+# backend so a knob only one of them understands cannot be declared
+# against another and then silently ignored.
+_MANAGED_SANDBOX_BACKENDS: tuple[str, ...] = ("openshell", "boxlite")
+
+
+def _parse_managed_sandbox(raw: object) -> ManagedSandboxSpec | None:
+    """
+    Parse the top-level ``managed_sandbox:`` block into a :class:`ManagedSandboxSpec`.
+
+    This block declares what the agent needs from the REMOTE sandbox a
+    managed session provisions for it, and is read server-side before
+    that sandbox exists. It is unrelated to ``os_env.sandbox``, which
+    confines the agent's own process once it is already running.
+
+    :param raw: The raw ``managed_sandbox:`` value from config.yaml — a
+        mapping keyed by sandbox backend, or absent (``None``). Example:
+        ``{"openshell": {"providers": ["gitlab-readonly"]}}``.
+    :returns: A populated :class:`ManagedSandboxSpec` when the block
+        declares something, ``None`` when absent or empty.
+    :raises OmnigentError: If *raw* is not a mapping, names a backend
+        that does not read this block, or holds a malformed
+        ``providers`` list.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            "managed_sandbox must be a YAML mapping keyed by sandbox backend "
+            f"(one of: {', '.join(_MANAGED_SANDBOX_BACKENDS)}), got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    unknown = sorted(str(key) for key in set(raw) - set(_MANAGED_SANDBOX_BACKENDS))
+    if unknown:
+        raise OmnigentError(
+            f"managed_sandbox names backend(s) that do not read this block: {', '.join(unknown)} "
+            f"— supported: {', '.join(_MANAGED_SANDBOX_BACKENDS)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    openshell = _parse_managed_sandbox_openshell(raw.get("openshell"))
+    boxlite = _parse_managed_sandbox_boxlite(raw.get("boxlite"))
+    # Every backend must be consulted before deciding the block is empty.
+    # Returning on the first absent one silently dropped a block that declared
+    # only the OTHER backend — the same silent-ignore this block's
+    # backend-keying exists to prevent.
+    if openshell is None and boxlite is None:
+        return None
+    return ManagedSandboxSpec(openshell=openshell, boxlite=boxlite)
+
+
+def _parse_managed_sandbox_openshell(raw: object) -> ManagedSandboxOpenShellSpec | None:
+    """
+    Parse ``managed_sandbox.openshell:`` into a :class:`ManagedSandboxOpenShellSpec`.
+
+    :param raw: The raw ``openshell:`` value — a mapping, or absent.
+        Example: ``{"providers": ["gitlab-readonly"]}``.
+    :returns: The parsed sub-block, or ``None`` when absent or declaring
+        nothing.
+    :raises OmnigentError: If *raw* is not a mapping or ``providers`` is
+        not a list of non-empty strings.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"managed_sandbox.openshell must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    names = raw.get("providers")
+    if names is None:
+        return None
+    # Names are opaque to omnigent — the gateway owns that namespace — so
+    # only the shape is checked, matching the server config's parser.
+    if not isinstance(names, list) or not all(
+        isinstance(name, str) and name.strip() for name in names
+    ):
+        raise OmnigentError(
+            "managed_sandbox.openshell.providers must be a list of OpenShell provider "
+            "record NAMES to attach, e.g. ['gitlab-readonly']",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return ManagedSandboxOpenShellSpec(providers=tuple(name.strip() for name in names))
+
+
+def _parse_managed_sandbox_boxlite(raw: object) -> ManagedSandboxBoxliteSpec | None:
+    """
+    Parse ``managed_sandbox.boxlite:`` into a :class:`ManagedSandboxBoxliteSpec`.
+
+    Both fields only ever NARROW the deployment's own
+    ``sandbox.boxlite`` config; the enforcement of that lives at launch
+    (``ManagedSandboxConfig.for_agent``), because only the server knows
+    what it offers. This parser checks shape alone, matching how
+    ``providers`` above is left opaque to its own namespace owner.
+
+    ``env: []`` is meaningful and must survive: it means *inject
+    nothing*, which is the strongest narrowing available, so it is
+    distinguished from an absent ``env:`` (keep the deployment's list).
+
+    :param raw: The raw ``boxlite:`` value — a mapping, or absent.
+        Example: ``{"image": "ghcr.io/acme/box@sha256:...", "env": ["MY_TOKEN"]}``.
+    :returns: The parsed sub-block, or ``None`` when absent or declaring
+        nothing.
+    :raises OmnigentError: If *raw* is not a mapping, ``image`` is not a
+        non-empty string, or ``env`` is not a list of non-empty strings.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"managed_sandbox.boxlite must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    image = raw.get("image")
+    if image is not None and not (isinstance(image, str) and image.strip()):
+        raise OmnigentError(
+            "managed_sandbox.boxlite.image must be a non-empty registry image "
+            "reference, e.g. 'ghcr.io/acme/box@sha256:...'",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    names = raw.get("env")
+    if names is not None and (
+        not isinstance(names, list)
+        or not all(isinstance(name, str) and name.strip() for name in names)
+    ):
+        raise OmnigentError(
+            "managed_sandbox.boxlite.env must be a list of environment variable "
+            "NAMES to inject, e.g. ['MY_TOKEN'] — a filter over what the server "
+            "already offers, never a free list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if image is None and names is None:
+        return None
+    return ManagedSandboxBoxliteSpec(
+        image=image.strip() if isinstance(image, str) else None,
+        env=tuple(name.strip() for name in names) if names is not None else None,
     )
 
 

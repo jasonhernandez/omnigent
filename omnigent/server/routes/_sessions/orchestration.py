@@ -2936,6 +2936,22 @@ async def _wait_for_host_bound_runner_client(
             await asyncio.gather(*outstanding, return_exceptions=True)
 
 
+def _managed_launch_agent_cache() -> AgentCache | None:
+    """The runtime's agent cache, or ``None`` when it isn't initialized.
+
+    A relaunch runs from a background task with no request scope to take
+    the cache from; a stripped wiring simply has none, and the launch
+    then falls back to the deployment's own credential-provider setting.
+    """
+    # Imported at call time so a test patching ``omnigent.runtime`` is honored.
+    from omnigent.runtime import get_agent_cache
+
+    try:
+        return cast("AgentCache | None", get_agent_cache())
+    except RuntimeError:
+        return None
+
+
 async def _run_managed_launch(
     *,
     session_id: str,
@@ -2951,6 +2967,8 @@ async def _run_managed_launch(
     provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    agent_cache: AgentCache | None = None,
+    requested_credential_providers: Sequence[str] | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -3015,14 +3033,40 @@ async def _run_managed_launch(
     :param agent_id: Agent the session is bound to, resolved through the
         built-in gate into the runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
+    :param agent_cache: Cache the agent's bundle is loaded through, so a
+        built-in's spec can declare the sandbox credential providers its
+        role needs. ``None`` (a stripped test wiring) skips that read.
+    :param requested_credential_providers: Credential providers the
+        create request asked for, or ``None``. May only narrow what the
+        agent spec or the server config declares.
     """
-    from omnigent.server.managed_hosts import resolve_managed_agent_label
+    from omnigent.server.managed_hosts import (
+        resolve_agent_credential_providers,
+        resolve_agent_managed_sandbox,
+        resolve_managed_agent_label,
+    )
 
     agent_name: str | None = None
+    agent_credential_providers: list[str] | None = None
+    agent_managed_sandbox = None
     if agent_store is not None and agent_id is not None:
         agent_name = await asyncio.to_thread(
             resolve_managed_agent_label,
             agent_store,
+            agent_id,
+            session_id=session_id,
+        )
+        agent_credential_providers = await asyncio.to_thread(
+            resolve_agent_credential_providers,
+            agent_store,
+            agent_cache,
+            agent_id,
+            session_id=session_id,
+        )
+        agent_managed_sandbox = await asyncio.to_thread(
+            resolve_agent_managed_sandbox,
+            agent_store,
+            agent_cache,
             agent_id,
             session_id=session_id,
         )
@@ -3036,6 +3080,9 @@ async def _run_managed_launch(
         relaunch_host=relaunch_host,
         provider=provider,
         agent_name=agent_name,
+        agent_credential_providers=agent_credential_providers,
+        agent_managed_sandbox=agent_managed_sandbox,
+        requested_credential_providers=requested_credential_providers,
     )
     if managed is None:
         return
@@ -3667,6 +3714,7 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
+            agent_cache=_managed_launch_agent_cache(),
         )
     )
     _managed_launch_tasks.add(relaunch_task)
