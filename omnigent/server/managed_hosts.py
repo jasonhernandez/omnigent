@@ -71,6 +71,21 @@ stores into ``create_app``):
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
            disk_size_gb: 100                           # shared; default: SDK default
+           cpus: 4                                     # shared; default: 2
+           memory_mib: 8192                            # shared; default: 4096
+           clone_from: warm-rust    # shared; clone this STOPPED operator-owned
+                                    # box copy-on-write instead of booting the
+                                    # image. image/cpus/memory_mib/disk_size_gb
+                                    # then describe the SOURCE box, and
+                                    # allow_net/secrets cannot be combined with it.
+           allow_net: [api.anthropic.com, github.com]  # shared; DNS allow-list.
+                                    # Omit for full egress; a list must also
+                                    # cover this server's own host.
+           secrets:                 # shared; value stays on the SERVER, the box
+             - name: claude         # only sees <BOXLITE_SECRET:claude>
+               source_env: CLAUDE_CODE_OAUTH_TOKEN   # SERVER env var NAME
+               hosts: [api.anthropic.com]            # where it is substituted
+               inject_env: CLAUDE_CODE_OAUTH_TOKEN   # BOX env var = placeholder
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -1298,7 +1313,21 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
-            section, {"image", "env", "local", "cloud", "disk_size_gb"}, "sandbox.boxlite"
+            section,
+            {
+                "image",
+                "env",
+                "local",
+                "cloud",
+                "disk_size_gb",
+                "cpus",
+                "memory_mib",
+                "agent_resources",
+                "clone_from",
+                "allow_net",
+                "secrets",
+            },
+            "sandbox.boxlite",
         )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
@@ -1308,6 +1337,12 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             home_dir,
             registry,
             _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
+            _parse_provider_positive_int(raw, "boxlite", "cpus"),
+            _parse_provider_positive_int(raw, "boxlite", "memory_mib"),
+            _parse_boxlite_agent_resources(section),
+            _parse_provider_string(raw, "boxlite", "clone_from"),
+            _parse_boxlite_allow_net(section),
+            _parse_boxlite_secrets(section),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -1677,6 +1712,12 @@ def _boxlite_launcher_factory(
     home_dir: str | None,
     registry: dict[str, object] | None,
     disk_size_gb: int | None,
+    cpus: int | None = None,
+    memory_mib: int | None = None,
+    agent_resources: dict[str, dict[str, int]] | None = None,
+    clone_from: str | None = None,
+    allow_net: list[str] | None = None,
+    secrets: list[dict[str, object]] | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
@@ -1696,6 +1737,15 @@ def _boxlite_launcher_factory(
         (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
         credential names), or ``None`` for anonymous pulls.
     :param disk_size_gb: Box disk size in GB, or ``None`` for the SDK default.
+    :param cpus: Box vCPU count, or ``None`` for the built-in default.
+    :param memory_mib: Box RAM in MiB, or ``None`` for the built-in default.
+        The built-in is not enough for every workload — a guest-side OOM shows
+        up host-side only as a stalled session — so operators need this knob.
+    :param clone_from: Name of a stopped warm box to clone copy-on-write, or
+        ``None`` to boot ``image``.
+    :param allow_net: Hostnames the box may resolve, or ``None`` for full egress.
+    :param secrets: Host-side credential entries (``name`` / ``source_env`` /
+        ``hosts`` / ``inject_env``), or ``None``.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
@@ -1710,9 +1760,61 @@ def _boxlite_launcher_factory(
             home_dir=home_dir,
             registry=registry,
             disk_size_gb=disk_size_gb,
+            cpus=cpus,
+            memory_mib=memory_mib,
+            agent_resources=agent_resources,
+            clone_from=clone_from,
+            allow_net=allow_net,
+            secrets=secrets,
         )
 
     return _build
+
+
+def _parse_boxlite_agent_resources(
+    section: dict[str, object],
+) -> dict[str, dict[str, int]] | None:
+    """Parse ``sandbox.boxlite.agent_resources`` — per-agent CPU/RAM overrides.
+
+    Shape::
+
+        agent_resources:
+          my-review-agent: {cpus: 2, memory_mib: 2048}
+          my-test-agent:   {memory_mib: 12288}
+
+    Either field may be given alone; the omitted one falls back to the
+    server-wide value. An agent absent from the map uses the server-wide value,
+    so adding an agent never requires touching this.
+
+    :param section: The ``sandbox.boxlite`` mapping.
+    :returns: The parsed map, or ``None`` when the key is absent.
+    :raises ValueError: On a malformed map, an unknown field, or a
+        non-positive-integer value — named precisely enough to fix.
+    """
+    raw = section.get("agent_resources")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("server config 'sandbox.boxlite.agent_resources' must be a mapping")
+    parsed: dict[str, dict[str, int]] = {}
+    for agent, spec in raw.items():
+        where = f"sandbox.boxlite.agent_resources.{agent}"
+        if not isinstance(spec, dict):
+            raise ValueError(f"server config '{where}' must be a mapping")
+        unknown = set(spec) - {"cpus", "memory_mib"}
+        if unknown:
+            raise ValueError(
+                f"server config '{where}' has unknown key(s): "
+                f"{', '.join(sorted(str(k) for k in unknown))} (allowed: cpus, memory_mib)"
+            )
+        fields: dict[str, int] = {}
+        for key, value in spec.items():
+            # bool is an int subclass; `cpus: true` would silently mean 1.
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"server config '{where}.{key}' must be a positive integer")
+            fields[str(key)] = value
+        parsed[str(agent)] = fields
+    return parsed
 
 
 def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
@@ -1837,6 +1939,96 @@ def _parse_boxlite_env(section: dict[str, object]) -> list[str] | None:
             "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', 'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _parse_boxlite_allow_net(section: dict[str, object]) -> list[str] | None:
+    """
+    Extract the optional shared ``sandbox.boxlite.allow_net`` — the DNS
+    allow-list handed to boxlite's ``NetworkSpec``.
+
+    :returns: The validated hostnames, or ``None`` for boxlite's default (full
+        egress).
+    :raises ValueError: When present but not a non-empty list of hostnames.
+    """
+    allow_net = section.get("allow_net")
+    if allow_net is None:
+        return None
+    if (
+        not isinstance(allow_net, list)
+        or not allow_net
+        or not all(isinstance(host, str) and host.strip() for host in allow_net)
+    ):
+        raise ValueError(
+            "server config 'sandbox.boxlite.allow_net' must be a non-empty list of "
+            "hostnames the box may reach, e.g. ['api.anthropic.com', 'github.com'] "
+            "(omit it for full egress). It must also cover this server's own host."
+        )
+    return [host.strip() for host in allow_net]
+
+
+# Every key one `sandbox.boxlite.secrets` entry may carry; all four are required.
+_BOXLITE_SECRET_KEYS: set[str] = {"name", "source_env", "hosts", "inject_env"}
+
+
+def _parse_boxlite_secrets(section: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract the optional shared ``sandbox.boxlite.secrets`` list.
+
+    Each entry names a credential rather than carrying it (12-factor):
+    ``source_env`` is the SERVER environment variable holding the value,
+    ``hosts`` the endpoints boxlite substitutes it into, and ``inject_env`` the
+    BOX variable that receives the ``<BOXLITE_SECRET:name>`` placeholder. The
+    launcher resolves the values and rejects name/``inject_env`` collisions;
+    this parse checks the config's shape.
+
+    :returns: The validated entries, or ``None`` when omitted.
+    :raises ValueError: When the list or any entry is malformed.
+    """
+    secrets = section.get("secrets")
+    if secrets is None:
+        return None
+    if not isinstance(secrets, list) or not secrets:
+        raise ValueError(
+            "server config 'sandbox.boxlite.secrets' must be a non-empty list of "
+            "{name, source_env, hosts, inject_env} entries"
+        )
+    return [_parse_boxlite_secret_entry(entry, index) for index, entry in enumerate(secrets)]
+
+
+def _parse_boxlite_secret_entry(entry: object, index: int) -> dict[str, object]:
+    """
+    Validate the shape of one ``sandbox.boxlite.secrets`` entry.
+
+    :param entry: The raw list element.
+    :param index: Its position, so the error names the offending entry.
+    :returns: The validated entry.
+    :raises ValueError: When the entry is not a mapping of the four required
+        keys with well-formed values.
+    """
+    path = f"sandbox.boxlite.secrets[{index}]"
+    if not isinstance(entry, dict):
+        raise ValueError(f"server config '{path}' must be a mapping")
+    _reject_unknown_keys(entry, _BOXLITE_SECRET_KEYS, path)
+    for key in sorted(_BOXLITE_SECRET_KEYS - {"hosts"}):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"server config '{path}.{key}' must be a non-empty string")
+    hosts = entry.get("hosts")
+    if (
+        not isinstance(hosts, list)
+        or not hosts
+        or not all(isinstance(host, str) and host.strip() for host in hosts)
+    ):
+        raise ValueError(
+            f"server config '{path}.hosts' must be a non-empty list of hostnames the "
+            "secret is substituted into, e.g. ['api.anthropic.com']"
+        )
+    return {
+        "name": str(entry["name"]).strip(),
+        "source_env": str(entry["source_env"]).strip(),
+        "inject_env": str(entry["inject_env"]).strip(),
+        "hosts": [host.strip() for host in hosts],
+    }
 
 
 def _parse_boxlite_home_dir(local: dict[str, object]) -> str | None:
@@ -3047,7 +3239,7 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[:8]}"
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        sandbox_id = await _provision_sandbox(launcher, host_name, agent_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3137,7 +3329,7 @@ async def relaunch_managed_host(
         )
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+        sandbox_id = await _provision_sandbox(launcher, host.name, agent_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3163,6 +3355,27 @@ async def relaunch_managed_host(
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+
+
+async def _provision_sandbox(
+    launcher: SandboxHostLauncher,
+    name: str,
+    agent_name: str | None = None,
+) -> str:
+    """Provision a sandbox, sizing it per agent where the provider can.
+
+    Gated on the capability, not on the value, exactly as
+    :func:`_start_sandbox_host` is: ``agent_name`` is declared only on a sizing
+    launcher's ``provision``, so the abstract signature does not carry it and
+    the call is cast. A provider leaving the flag ``False`` never sees it.
+
+    Sizing rides ``provision`` rather than ``start_host`` because CPU and RAM
+    are fixed when the box is created — by ``start_host`` the box exists.
+    """
+    if agent_name is not None and launcher.capabilities.sizes_sandbox_by_agent:
+        provision_sized = cast(Callable[..., str], launcher.provision)
+        return await asyncio.to_thread(provision_sized, name, agent_name=agent_name)
+    return await asyncio.to_thread(launcher.provision, name)
 
 
 async def _start_sandbox_host(

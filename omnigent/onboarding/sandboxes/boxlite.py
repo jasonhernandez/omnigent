@@ -41,8 +41,10 @@ import asyncio
 import contextlib
 import os
 import platform
+import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import click
@@ -86,6 +88,39 @@ set."""
 # is enough for a host running one interactive session.
 _SANDBOX_CPU: int = 2
 _SANDBOX_MEMORY_MIB: int = 4096
+
+# A secret NAME becomes the placeholder the box sees, so keep it to characters
+# that survive an HTTP header verbatim. An inject_env NAME must be a POSIX
+# environment variable name — anything else is silently unusable in the guest.
+_SECRET_NAME_RE: re.Pattern[str] = re.compile(r"[A-Za-z0-9_-]+")
+_ENV_NAME_RE: re.Pattern[str] = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _secret_placeholder(name: str) -> str:
+    """
+    Return the placeholder the box sees for the secret *name*.
+
+    Mirrors boxlite's own ``Secret.get_placeholder()``; computed here because
+    the box env is assembled before the SDK objects are constructed on the
+    loop thread.
+    """
+    return f"<BOXLITE_SECRET:{name}>"
+
+
+@dataclass(frozen=True)
+class _SecretBinding:
+    """
+    One resolved ``sandbox.boxlite.secrets`` entry.
+
+    ``value`` is excluded from the repr so a traceback or a log line that
+    happens to render a binding cannot leak the credential.
+    """
+
+    name: str
+    hosts: tuple[str, ...]
+    inject_env: str
+    value: str = field(repr=False)
+
 
 # Marshalling timeouts (seconds). The first provision from a given image makes
 # boxlite pull the OCI image and boot a fresh micro-VM, which for the ~GiB host
@@ -205,6 +240,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             file_copy=False,
             streaming_exec=False,
             foreground_exec=False,
+            sizes_sandbox_by_agent=True,
         )
 
     def __init__(
@@ -216,6 +252,12 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         home_dir: str | None = None,
         registry: Mapping[str, object] | None = None,
         disk_size_gb: int | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
+        agent_resources: Mapping[str, Mapping[str, int]] | None = None,
+        clone_from: str | None = None,
+        allow_net: Sequence[str] | None = None,
+        secrets: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -245,9 +287,35 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             ``password_env`` / ``token_env``. The ``*_env`` keys NAME server
             environment variables holding the credentials (12-factor; values
             never live in config). ``None`` uses anonymous pulls.
+        :param cpus: Box vCPU count — the server's ``sandbox.boxlite.cpus``
+            config. ``None`` keeps the built-in default.
+        :param memory_mib: Box RAM in MiB — the server's
+            ``sandbox.boxlite.memory_mib`` config. ``None`` keeps the built-in
+            default. The built-in 4096 is not enough for every workload: a
+            Python test suite OOM-killed its workers inside the guest, which
+            surfaces host-side only as a stalled session, so this needs to be
+            operator-tunable rather than baked in.
         :param disk_size_gb: Box disk size in GB — the server's
             ``sandbox.boxlite.disk_size_gb`` config. ``None`` uses the SDK's
             own default.
+        :param clone_from: Name (or id) of a STOPPED, operator-owned warm box
+            to clone copy-on-write instead of booting the image — the server's
+            ``sandbox.boxlite.clone_from`` config. ``None`` boots the image.
+            When set, ``image`` / ``cpus`` / ``memory_mib`` / ``disk_size_gb``
+            describe the SOURCE box, not the clone (see :meth:`_aclone`).
+        :param allow_net: Hostnames the box may resolve — the server's
+            ``sandbox.boxlite.allow_net`` config, e.g.
+            ``["api.anthropic.com", "github.com"]``. ``None`` keeps boxlite's
+            default of full egress. An allow-list must also cover this server's
+            own host, which the in-box host dials back to.
+        :param secrets: Host-side credentials — the server's
+            ``sandbox.boxlite.secrets`` config, each entry a mapping of
+            ``name`` / ``source_env`` / ``hosts`` / ``inject_env``. The value
+            stays on the omnigent-server host and boxlite's proxy substitutes
+            it into HTTPS requests to ``hosts``; the box only ever sees the
+            ``<BOXLITE_SECRET:name>`` placeholder in ``inject_env``. Prefer
+            this over ``env`` for credentials: anything the agent runs can read
+            an ``env`` value.
 
         When ``home_dir`` or ``registry`` is set the launcher builds a
         customized ``Boxlite(Options(...))`` runtime; otherwise it uses the
@@ -259,6 +327,14 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._home_dir = home_dir
         self._registry = dict(registry) if registry is not None else None
         self._disk_size_gb = disk_size_gb
+        self._cpus = cpus if cpus is not None else _SANDBOX_CPU
+        self._memory_mib = memory_mib if memory_mib is not None else _SANDBOX_MEMORY_MIB
+        self._agent_resources = {
+            str(agent): dict(spec) for agent, spec in (agent_resources or {}).items()
+        }
+        self._clone_from = clone_from
+        self._allow_net = tuple(allow_net) if allow_net is not None else None
+        self._secrets = tuple(secrets) if secrets is not None else None
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -365,6 +441,104 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             resolved.append((name, value))
         return resolved
 
+    def _resolve_secrets(self, env_names: set[str]) -> list[_SecretBinding]:
+        """
+        Validate the configured secret entries and resolve their values.
+
+        Config carries NAMES, never values (12-factor, same as
+        :meth:`_resolve_sandbox_env`): ``source_env`` names the SERVER variable
+        holding the credential, ``inject_env`` names the BOX variable that
+        receives the placeholder.
+
+        :param env_names: Names ``sandbox.boxlite.env`` already injects
+            verbatim. An ``inject_env`` colliding with one of them is rejected:
+            which of the two wins would be undefined, and losing the race means
+            the box gets the real credential instead of a placeholder.
+        :returns: One binding per configured secret.
+        :raises click.ClickException: On a malformed entry, a duplicate name or
+            ``inject_env``, or a ``source_env`` unset in the server environment.
+        """
+        bindings: list[_SecretBinding] = []
+        injected = set(env_names)
+        names: set[str] = set()
+        for entry in self._secrets or ():
+            binding = self._secret_binding(entry)
+            if binding.name in names:
+                raise click.ClickException(
+                    f"sandbox.boxlite.secrets declares the name '{binding.name}' "
+                    "twice — each name mints one placeholder, so they must be unique."
+                )
+            if binding.inject_env in injected:
+                raise click.ClickException(
+                    f"sandbox.boxlite.secrets entry '{binding.name}' injects "
+                    f"'{binding.inject_env}', which sandbox.boxlite.env or another "
+                    "secret already injects — drop one, or the box may receive the "
+                    "real credential instead of the placeholder."
+                )
+            names.add(binding.name)
+            injected.add(binding.inject_env)
+            bindings.append(binding)
+        return bindings
+
+    def _secret_binding(self, entry: Mapping[str, object]) -> _SecretBinding:
+        """
+        Validate one ``sandbox.boxlite.secrets`` entry and resolve its value.
+
+        :param entry: The raw config mapping for one secret.
+        :returns: The resolved binding.
+        :raises click.ClickException: When the entry is malformed, or its
+            ``source_env`` is not set in the server process environment.
+        """
+        name = str(entry.get("name") or "")
+        if not _SECRET_NAME_RE.fullmatch(name):
+            raise click.ClickException(
+                f"sandbox.boxlite.secrets has an entry whose name is '{name}' — a "
+                "name must match [A-Za-z0-9_-]+ (it becomes the "
+                "<BOXLITE_SECRET:name> placeholder the box sends)."
+            )
+        raw_hosts = entry.get("hosts")
+        hosts = (
+            tuple(str(host) for host in raw_hosts) if isinstance(raw_hosts, list | tuple) else ()
+        )
+        if not hosts:
+            raise click.ClickException(
+                f"sandbox.boxlite.secrets entry '{name}' must list at least one "
+                "host — the value is only substituted into requests to those "
+                "hosts, so an empty list injects a placeholder that never resolves."
+            )
+        inject_env = str(entry.get("inject_env") or "")
+        if not _ENV_NAME_RE.fullmatch(inject_env):
+            raise click.ClickException(
+                f"sandbox.boxlite.secrets entry '{name}' has inject_env "
+                f"'{inject_env}', which is not a valid environment variable name "
+                "([A-Za-z_][A-Za-z0-9_]*)."
+            )
+        source_env = str(entry.get("source_env") or "")
+        if not source_env:
+            raise click.ClickException(
+                f"sandbox.boxlite.secrets entry '{name}' must set source_env — the "
+                "SERVER environment variable NAME holding the credential."
+            )
+        value = os.environ.get(source_env)
+        if value is None:
+            raise click.ClickException(
+                f"sandbox.boxlite.secrets entry '{name}' names env var "
+                f"'{source_env}' but it is not set in the server's environment — "
+                "set it (or remove the entry)."
+            )
+        return _SecretBinding(name=name, hosts=hosts, inject_env=inject_env, value=value)
+
+    def _network_spec(self) -> boxlite_sdk.NetworkSpec | None:
+        """
+        Build the DNS allow-list spec, or ``None`` for boxlite's default (full
+        egress) so the in-box host can reach ``server_url`` unconfigured.
+        """
+        if not self._allow_net:
+            return None
+        import boxlite
+
+        return boxlite.NetworkSpec(mode="enabled", allow_net=list(self._allow_net))
+
     def prepare(self) -> None:
         """
         Local preflight: the boxlite SDK must be installed, and — for LOCAL
@@ -387,37 +561,83 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 "sandbox.boxlite.cloud.endpoint at a remote `boxlite serve`."
             )
 
-    def provision(self, name: str) -> str:
+    def _resources_for(self, agent_name: str | None) -> tuple[int, int]:
+        """Resolve (cpus, memory_mib) for one job.
+
+        A per-agent entry overrides the server-wide value, and may set either
+        field alone. An unknown agent falls back to the server-wide value, so
+        adding an agent never has to touch this map.
+
+        :param agent_name: Resolved built-in agent, or ``None``.
+        :returns: The ``(cpus, memory_mib)`` this box should be created with.
         """
-        Create a new BoxLite box from the host image.
+        override = self._agent_resources.get(agent_name or "", {})
+        return (
+            int(override.get("cpus", self._cpus)),
+            int(override.get("memory_mib", self._memory_mib)),
+        )
+
+    def provision(self, name: str, *, agent_name: str | None = None) -> str:
+        """
+        Create a new BoxLite box — from the host image, or (when
+        ``clone_from`` is set) copy-on-write from a warm source box.
 
         The box is detached and persistent (``detach=True``,
         ``auto_remove=False``); the managed-session machinery owns its teardown
         (session delete / relaunch → ``terminate``).
         Network defaults to full egress (boxlite ``NetworkSpec`` default
-        ``Enabled``) so the in-box host can reach ``server_url``.
+        ``Enabled``) so the in-box host can reach ``server_url``; configured
+        ``allow_net`` hosts narrow that to a DNS allow-list.
 
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``. Recorded
             as the box name; the returned id is the canonical reference.
         :returns: The box id.
-        :raises click.ClickException: If box creation fails.
+        :raises click.ClickException: If box creation fails, the configured
+            ``clone_from`` source is missing or running, or a secret entry is
+            malformed or unresolvable.
         """
         _ensure_sdk()
+        if self._clone_from and (self._secrets or self._allow_net):
+            # clone_box takes no BoxOptions, so a clone inherits the SOURCE
+            # box's network policy and secret bindings. Silently dropping a
+            # security control would be worse than refusing the combination.
+            raise click.ClickException(
+                "sandbox.boxlite.clone_from cannot be combined with allow_net or "
+                "secrets: a clone inherits the source box's network policy and "
+                "secret bindings, so they must be set when the warm source box is "
+                "created."
+            )
         resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         env = self._resolve_sandbox_env()
+        cpus, memory_mib = self._resources_for(agent_name)
+        secrets = self._resolve_secrets({env_name for env_name, _ in env})
+        # The box receives the placeholder, never the value — boxlite's host-side
+        # proxy substitutes the real credential on the way out.
+        env += [(binding.inject_env, _secret_placeholder(binding.name)) for binding in secrets]
         target = self._endpoint or "local"
-        click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
+        if self._clone_from:
+            click.echo(f"▸ Cloning boxlite box '{name}' from '{self._clone_from}' ({target})")
+        else:
+            click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
 
         async def _do() -> str:
             import boxlite
 
             runtime = await self._aruntime()
+            if self._clone_from:
+                box = await self._aclone(runtime, self._clone_from, name)
+                return str(box.id)
             options = boxlite.BoxOptions(
                 image=resolved_ref,
-                cpus=_SANDBOX_CPU,
-                memory_mib=_SANDBOX_MEMORY_MIB,
+                cpus=cpus,
+                memory_mib=memory_mib,
                 disk_size_gb=self._disk_size_gb,
                 env=env,
+                network=self._network_spec(),
+                secrets=[
+                    boxlite.Secret(name=b.name, value=b.value, hosts=list(b.hosts))
+                    for b in secrets
+                ],
                 auto_remove=False,
                 detach=True,
             )
@@ -438,6 +658,62 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             raise click.ClickException(f"boxlite box creation failed: {exc}") from exc
         click.echo(f"  → created {box_id}")
         return str(box_id)
+
+    async def _aclone(
+        self, runtime: boxlite_sdk.Boxlite, source: str, name: str
+    ) -> boxlite_sdk.Box:
+        """
+        Clone a warm source box copy-on-write instead of booting the image.
+
+        The source is operator-owned — created and refreshed outside omnigent —
+        and must be STOPPED: a clone copies the source's disks, so cloning a
+        running box captures a mid-write filesystem.
+
+        ``clone_box(*, options=CloneOptions, name=...)`` is the SDK's whole
+        surface here, and ``CloneOptions`` carries no fields (boxlite 0.9.5
+        documents it as a forward-compatible placeholder). So ``image`` /
+        ``cpus`` / ``memory_mib`` / ``disk_size_gb`` / network / secrets all
+        describe the SOURCE box; a clone inherits them and cannot override
+        them. Env is the exception — :meth:`run` applies it per-exec.
+
+        :param runtime: The loop-bound boxlite runtime handle.
+        :param source: Name or id of the warm box to clone.
+        :param name: Name for the new box.
+        :returns: The cloned box handle.
+        :raises click.ClickException: When the source is missing or running.
+        """
+        warm = await runtime.get(source)
+        if warm is None:
+            raise click.ClickException(
+                f"sandbox.boxlite.clone_from names box '{source}', but no box by "
+                "that name exists on this boxlite runtime — create the warm "
+                "source box (and leave it stopped) before launching a managed "
+                "session."
+            )
+        if (await warm.info()).state.running:
+            raise click.ClickException(
+                f"sandbox.boxlite.clone_from box '{source}' is running — stop it "
+                "first. A clone copies the source's disks, so cloning a running "
+                "box captures a mid-write filesystem."
+            )
+        return await warm.clone_box(name=name)
+
+    def _clone_exec_env(self) -> list[tuple[str, str]] | None:
+        """
+        Env to apply on every ``box.exec``, or ``None`` when ``BoxOptions.env``
+        already carries it.
+
+        ``clone_box`` takes no ``BoxOptions``, so a cloned box inherits the
+        SOURCE box's environment and never sees ``sandbox.boxlite.env``.
+        ``box.exec(env=...)`` is the only lane the SDK offers to supply it
+        after the fact, so the clone path resolves the names per exec.
+
+        :raises click.ClickException: When a configured name is not set in the
+            server process environment.
+        """
+        if not self._clone_from:
+            return None
+        return self._resolve_sandbox_env() or None
 
     def _best_effort_remove(self, name_or_id: str) -> None:
         """
@@ -469,6 +745,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             and the command exits non-zero.
         """
         _ensure_sdk()
+        exec_env = self._clone_exec_env()
 
         async def _drain(
             getter: Callable[[], Any], sink: list[str], *, echo: bool, err: bool = False
@@ -504,7 +781,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             # method is bound to a local first so the fork-PR security scan's
             # builtin-exec call heuristic doesn't flag this sandbox command.)
             run_in_box = box.exec
-            execution = await run_in_box("sh", ["-lc", command], timeout_secs=_RUN_TIMEOUT_S)
+            execution = await run_in_box(
+                "sh", ["-lc", command], env=exec_env, timeout_secs=_RUN_TIMEOUT_S
+            )
             out_parts: list[str] = []
             err_parts: list[str] = []
             # Drain both streams concurrently: draining one to EOF first can

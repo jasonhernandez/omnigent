@@ -45,6 +45,7 @@ class _ExecCall:
 
     command: str
     args: list[str]
+    env: object = None
     timeout_secs: float | None = None
 
 
@@ -104,17 +105,51 @@ class _FakeExecution:
         return _FakeExecResult(exit_code=self._exit_code, error_message=self._error_message)
 
 
+@dataclass
+class _FakeBoxStateInfo:
+    """Stand-in for ``BoxStateInfo`` (only ``running`` is load-bearing)."""
+
+    running: bool = False
+
+
+@dataclass
+class _FakeBoxInfo:
+    """Stand-in for ``BoxInfo`` — ``info().state.running`` gates cloning."""
+
+    state: _FakeBoxStateInfo
+
+
+@dataclass
+class _CloneCall:
+    """One recorded ``box.clone_box`` invocation."""
+
+    source_id: str
+    name: str | None
+    options: object
+
+
 class _FakeBox:
     """Recording stand-in for a boxlite ``Box`` handle."""
 
-    def __init__(self, box_id: str) -> None:
+    def __init__(self, box_id: str, *, running: bool = False) -> None:
         self.id = box_id
+        self.running = running
+        self.clone_result: _FakeBox | None = None
+        self.clone_calls: list[_CloneCall] = []
         self.exec_calls: list[_ExecCall] = []
         # (exit_code, stdout_lines, stderr_lines) handed back by successive
         # exec calls; empty queue yields a success no-output.
         self.exec_queue: list[tuple[int, list[str], list[str]]] = []
         self.exec_raises: Exception | None = None
         self.streams_raise: bool = False  # make stdout()/stderr() raise (SDK shape)
+
+    async def info(self) -> _FakeBoxInfo:
+        return _FakeBoxInfo(state=_FakeBoxStateInfo(running=self.running))
+
+    async def clone_box(self, *, options: object = None, name: str | None = None) -> _FakeBox:
+        self.clone_calls.append(_CloneCall(source_id=self.id, name=name, options=options))
+        assert self.clone_result is not None, "test must set clone_result"
+        return self.clone_result
 
     async def _exec(
         self,
@@ -126,7 +161,7 @@ class _FakeBox:
         **kwargs: object,
     ) -> _FakeExecution:
         self.exec_calls.append(
-            _ExecCall(command=command, args=list(args or []), timeout_secs=timeout_secs)
+            _ExecCall(command=command, args=list(args or []), env=env, timeout_secs=timeout_secs)
         )
         if self.exec_raises is not None:
             raise self.exec_raises
@@ -141,6 +176,39 @@ class _FakeBox:
     exec = _exec
 
 
+class _FakeSecret:
+    """
+    Stand-in for ``Secret``. Mirrors the real class's redacting repr so a test
+    failure cannot print a credential.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        value: str,
+        hosts: list[str] | None = None,
+        placeholder: str | None = None,
+    ) -> None:
+        self.name = name
+        self.value = value
+        self.hosts = list(hosts or [])
+        self.placeholder = placeholder
+
+    def get_placeholder(self) -> str:
+        return self.placeholder or f"<BOXLITE_SECRET:{self.name}>"
+
+    def __repr__(self) -> str:
+        return f"_FakeSecret(name={self.name!r}, hosts={self.hosts!r}, value=[REDACTED])"
+
+
+@dataclass
+class _FakeNetworkSpec:
+    """Stand-in for ``NetworkSpec`` (mode + DNS allow-list)."""
+
+    mode: str
+    allow_net: list[str] = field(default_factory=list)
+
+
 class _FakeBoxOptions:
     """Recording mirror of ``BoxOptions`` kwargs the launcher passes."""
 
@@ -151,6 +219,8 @@ class _FakeBoxOptions:
         memory_mib: int | None = None,
         disk_size_gb: int | None = None,
         env: object = None,
+        network: object = None,
+        secrets: list[_FakeSecret] | None = None,
         auto_remove: bool | None = None,
         detach: bool | None = None,
         **kwargs: object,
@@ -160,6 +230,8 @@ class _FakeBoxOptions:
         self.memory_mib = memory_mib
         self.disk_size_gb = disk_size_gb
         self.env = env if env is not None else []
+        self.network = network
+        self.secrets = list(secrets or [])
         self.auto_remove = auto_remove
         self.detach = detach
         self.extra = kwargs
@@ -302,6 +374,8 @@ def _install_fake_boxlite(monkeypatch: pytest.MonkeyPatch) -> _FakeBoxliteState:
     fake.BoxliteRestOptions = _FakeRestOptions  # type: ignore[attr-defined]
     fake.Options = _FakeOptions  # type: ignore[attr-defined]
     fake.ImageRegistry = _FakeImageRegistry  # type: ignore[attr-defined]
+    fake.Secret = _FakeSecret  # type: ignore[attr-defined]
+    fake.NetworkSpec = _FakeNetworkSpec  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "boxlite", fake)
     return state
 
@@ -459,6 +533,236 @@ def test_provision_wraps_sdk_errors_with_provider_reason(
 
     with pytest.raises(click.ClickException, match="no KVM device"):
         BoxliteSandboxLauncher().provision("a")
+
+
+# ── provision: allow_net and secrets ────────────────────────
+
+
+def _secret_entry(**overrides: object) -> dict[str, object]:
+    """A well-formed ``sandbox.boxlite.secrets`` entry, with overrides applied."""
+    entry: dict[str, object] = {
+        "name": "claude",
+        "source_env": "CLAUDE_CODE_OAUTH_TOKEN",
+        "hosts": ["api.anthropic.com"],
+        "inject_env": "CLAUDE_CODE_OAUTH_TOKEN",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_provision_without_allow_net_or_secrets_keeps_defaults(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """
+    Unconfigured, the box keeps boxlite's default full egress and no secrets —
+    the in-box host must be able to dial ``server_url`` out of the box.
+    """
+    BoxliteSandboxLauncher().provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.network is None
+    assert create.options.secrets == []
+
+
+def test_provision_allow_net_becomes_network_spec(fake_boxlite: _FakeBoxliteState) -> None:
+    """``allow_net`` narrows egress to a DNS allow-list."""
+    BoxliteSandboxLauncher(allow_net=["api.anthropic.com", "github.com"]).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.network.mode == "enabled"
+    assert create.options.network.allow_net == ["api.anthropic.com", "github.com"]
+
+
+def test_provision_secrets_inject_placeholder_not_value(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The credential rides a ``Secret`` bound to its hosts (where boxlite's
+    host-side proxy substitutes it); the box env gets only the placeholder, so
+    nothing the agent runs can read the real value.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-secret")
+
+    BoxliteSandboxLauncher(secrets=[_secret_entry()]).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    [secret] = create.options.secrets
+    assert secret.name == "claude"
+    assert secret.value == "sk-ant-oat-secret"
+    assert secret.hosts == ["api.anthropic.com"]
+    assert create.options.env == [("CLAUDE_CODE_OAUTH_TOKEN", "<BOXLITE_SECRET:claude>")]
+
+
+def test_provision_secret_missing_source_env_fails_loud(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A ``source_env`` unset in the server environment is an operator error,
+    mirroring ``sandbox.boxlite.env`` — never launch without a credential the
+    agent needs.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    with pytest.raises(click.ClickException, match="CLAUDE_CODE_OAUTH_TOKEN"):
+        BoxliteSandboxLauncher(secrets=[_secret_entry()]).provision("a")
+    assert fake_boxlite.create_calls == []
+
+
+def test_provision_secret_value_never_reaches_the_error_text(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A failure after the value is resolved must not echo it: the whole point of
+    a ``Secret`` is that the credential stays on the host.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-secret")
+    fake_boxlite.create_raises = _FakeBoxliteError("no KVM device")
+
+    with pytest.raises(click.ClickException) as excinfo:
+        BoxliteSandboxLauncher(secrets=[_secret_entry()]).provision("a")
+    assert "sk-ant-oat-secret" not in str(excinfo.value)
+
+
+def test_provision_secret_inject_env_colliding_with_env_is_rejected(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ``inject_env`` that ``sandbox.boxlite.env`` also injects is ambiguous,
+    and losing the race hands the box the real credential — reject it.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-secret")
+
+    with pytest.raises(click.ClickException, match="already injects"):
+        BoxliteSandboxLauncher(
+            env=["CLAUDE_CODE_OAUTH_TOKEN"], secrets=[_secret_entry()]
+        ).provision("a")
+    assert fake_boxlite.create_calls == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"name": "claude/prod"}, "name"),
+        ({"hosts": []}, "at least one host"),
+        ({"inject_env": "2TOKEN"}, "inject_env"),
+        ({"source_env": ""}, "source_env"),
+    ],
+)
+def test_provision_rejects_malformed_secret_entry(
+    fake_boxlite: _FakeBoxliteState,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    """Each malformed field fails loud, naming the offending config key."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-secret")
+
+    with pytest.raises(click.ClickException, match=match):
+        BoxliteSandboxLauncher(secrets=[_secret_entry(**overrides)]).provision("a")
+    assert fake_boxlite.create_calls == []
+
+
+def test_provision_rejects_clone_from_with_secrets_or_allow_net(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """
+    ``clone_box`` takes no ``BoxOptions``, so a clone inherits the SOURCE box's
+    network policy and secret bindings. Refuse rather than silently drop a
+    security control.
+    """
+    with pytest.raises(click.ClickException, match="clone_from"):
+        BoxliteSandboxLauncher(clone_from="warm", allow_net=["github.com"]).provision("a")
+    with pytest.raises(click.ClickException, match="clone_from"):
+        BoxliteSandboxLauncher(clone_from="warm", secrets=[_secret_entry()]).provision("a")
+    assert fake_boxlite.create_calls == []
+
+
+# ── provision: clone_from a warm box ────────────────────────
+
+
+def _add_warm_box(
+    state: _FakeBoxliteState, name: str = "warm-rust", *, running: bool = False
+) -> _FakeBox:
+    """Register a warm source box (plus the clone it hands back) under *name*."""
+    warm = _FakeBox(f"bl-{name}", running=running)
+    warm.clone_result = _FakeBox(f"bl-clone-of-{name}")
+    state.boxes[name] = warm
+    state.boxes[warm.clone_result.id] = warm.clone_result
+    return warm
+
+
+def test_provision_clone_from_clones_warm_box(fake_boxlite: _FakeBoxliteState) -> None:
+    """
+    ``clone_from`` clones the stopped warm box copy-on-write and never boots the
+    image — the whole point is skipping a cold boot plus a cold build cache.
+    """
+    warm = _add_warm_box(fake_boxlite)
+
+    box_id = BoxliteSandboxLauncher(clone_from="warm-rust").provision("managed-abc")
+
+    assert box_id == "bl-clone-of-warm-rust"
+    [clone] = warm.clone_calls
+    assert clone.name == "managed-abc"
+    assert fake_boxlite.create_calls == []
+
+
+def test_provision_clone_from_missing_source_fails_loud(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """A ``clone_from`` naming no box is an operator error, not a silent fallback."""
+    with pytest.raises(click.ClickException, match="clone_from"):
+        BoxliteSandboxLauncher(clone_from="warm-rust").provision("managed-abc")
+    assert fake_boxlite.create_calls == []
+
+
+def test_provision_clone_from_running_source_fails_loud(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """
+    Cloning copies the source's disks, so a RUNNING source would hand the
+    session a mid-write filesystem — refuse rather than clone it.
+    """
+    warm = _add_warm_box(fake_boxlite, running=True)
+
+    with pytest.raises(click.ClickException, match="is running"):
+        BoxliteSandboxLauncher(clone_from="warm-rust").provision("managed-abc")
+    assert warm.clone_calls == []
+
+
+def test_run_applies_env_per_exec_on_a_cloned_box(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``clone_box`` takes no ``BoxOptions``, so a clone never sees
+    ``sandbox.boxlite.env`` — the launcher must supply it through
+    ``box.exec(env=...)``, the SDK's only post-clone lane.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
+    _add_warm_box(fake_boxlite)
+    launcher = BoxliteSandboxLauncher(clone_from="warm-rust", env=["OPENAI_API_KEY"])
+
+    box_id = launcher.provision("managed-abc")
+    launcher.run(box_id, "true")
+
+    [call] = fake_boxlite.boxes[box_id].exec_calls
+    assert call.env == [("OPENAI_API_KEY", "sk-test-123")]
+
+
+def test_run_passes_no_exec_env_without_clone_from(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A box created from the image already carries the env on ``BoxOptions``, so
+    exec keeps the guest's own environment (no per-exec override).
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
+    launcher = BoxliteSandboxLauncher(env=["OPENAI_API_KEY"])
+
+    box_id = launcher.provision("managed-abc")
+    launcher.run(box_id, "true")
+
+    [call] = fake_boxlite.boxes[box_id].exec_calls
+    assert call.env is None
 
 
 # ── local vs cloud runtime switch ───────────────────────────
@@ -782,3 +1086,74 @@ def test_run_tolerates_unavailable_streams(fake_boxlite: _FakeBoxliteState) -> N
     box.exec_queue.append((0, [], []))
     result = launcher.run(box_id, "true")
     assert result.returncode == 0
+
+
+def test_resources_for_prefers_the_agent_override() -> None:
+    """A per-agent entry wins over the server-wide value."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"cpus": 8, "memory_mib": 12288}}
+    )
+    assert launcher._resources_for("tester") == (8, 12288)
+
+
+def test_resources_for_falls_back_field_by_field() -> None:
+    """An override may set one field; the other keeps the server-wide value."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    )
+    assert launcher._resources_for("tester") == (2, 12288)
+
+
+def test_resources_for_unknown_or_missing_agent_uses_the_server_wide_value() -> None:
+    """Adding an agent must never require touching the override map."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"cpus": 8}}
+    )
+    assert launcher._resources_for("someone-else") == (2, 4096)
+    assert launcher._resources_for(None) == (2, 4096)
+
+
+def test_boxlite_declares_it_sizes_sandboxes_by_agent() -> None:
+    """The managed path only threads agent_name when this is declared."""
+    assert BoxliteSandboxLauncher().capabilities.sizes_sandbox_by_agent is True
+
+
+def test_provision_cpus_and_memory_reach_box_options(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """The passthrough itself. Gutting it left all 862 tests passing.
+
+    The suite covered config->constructor and `_resources_for()` in isolation,
+    but nothing asserted the values reach `BoxOptions` — so reverting
+    `provision()` to the old hardcoded constants broke nothing. Mirrors
+    test_provision_disk_size_gb_reaches_box_options.
+    """
+    BoxliteSandboxLauncher(cpus=4, memory_mib=8192).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.cpus == 4
+    assert create.options.memory_mib == 8192
+
+
+def test_provision_sizes_the_box_for_the_named_agent(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """The per-agent override must reach BoxOptions, not just _resources_for."""
+    BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    ).provision("managed-abc", agent_name="tester")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.memory_mib == 12288
+    assert create.options.cpus == 2  # falls back field-by-field
+
+
+def test_provision_unknown_agent_gets_the_server_wide_size(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    ).provision("managed-abc", agent_name="someone-else")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.memory_mib == 4096
