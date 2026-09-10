@@ -83,6 +83,13 @@ class SandboxCapabilities:
         ``omnigent.ai/agent`` label). When set, the managed launch path
         threads ``agent_name`` into ``start_host``; providers that leave
         it ``False`` never receive the keyword.
+    :param sizes_sandbox_by_agent: Provider sizes the sandbox (CPU/RAM) from
+        the session's resolved built-in agent, so a review agent and a
+        test-suite agent get different allocations. When set, the managed
+        launch path threads ``agent_name`` into ``provision``; providers that
+        leave it ``False`` never receive the keyword. Resources are fixed at
+        create time, which is why this rides ``provision`` and not
+        ``start_host`` like ``classifies_runner_by_agent``.
     :param snapshot_restore: Resuming a stopped sandbox restores a
         suspend-time snapshot (dependencies installed, caches warm)
         rather than cold-starting it. Only meaningful alongside
@@ -101,6 +108,7 @@ class SandboxCapabilities:
     # New fields append at the end to preserve positional-constructor
     # compatibility for out-of-tree providers.
     snapshot_restore: bool = False
+    sizes_sandbox_by_agent: bool = False
 
 
 @dataclass(frozen=True)

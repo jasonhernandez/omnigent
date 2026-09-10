@@ -496,6 +496,106 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.disk_size_gb is None
 
 
+def test_parse_boxlite_agent_resources_reach_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-agent overrides reach the launcher; either field may stand alone."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://s.example.com",
+            "boxlite": {
+                "memory_mib": 4096,
+                "agent_resources": {
+                    "reviewer": {"cpus": 2, "memory_mib": 2048},
+                    "tester": {"memory_mib": 12288},
+                },
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.agent_resources == {
+        "reviewer": {"cpus": 2, "memory_mib": 2048},
+        "tester": {"memory_mib": 12288},
+    }
+
+
+@pytest.mark.parametrize(
+    ("bad", "expected"),
+    [
+        ({"agent_resources": []}, "sandbox.boxlite.agent_resources"),
+        ({"agent_resources": {"a": 3}}, "sandbox.boxlite.agent_resources.a"),
+        ({"agent_resources": {"a": {"ram": 1}}}, "unknown key"),
+        ({"agent_resources": {"a": {"cpus": 0}}}, "sandbox.boxlite.agent_resources.a.cpus"),
+        ({"agent_resources": {"a": {"cpus": True}}}, "sandbox.boxlite.agent_resources.a.cpus"),
+    ],
+)
+def test_parse_boxlite_agent_resources_fail_loud(bad: dict, expected: str) -> None:
+    """A malformed override names the exact agent and field that is wrong."""
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        parse_sandbox_config(
+            {"provider": "boxlite", "server_url": "https://s.example.com", "boxlite": bad}
+        )
+
+
+def test_parse_boxlite_resources_reach_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `sandbox.boxlite.cpus` / `memory_mib` reach the launcher.
+
+    These were module constants, so a workload that needed more than the
+    built-in 4096 MiB had no way to ask for it: the guest kernel OOM-killed it
+    and the host saw only a stalled session.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://s.example.com",
+            "boxlite": {"cpus": 4, "memory_mib": 8192},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.cpus == 4
+    assert fake.memory_mib == 8192
+
+
+def test_parse_boxlite_resources_default_to_none_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting them keeps the launcher's own defaults — None, not 0."""
+    cfg = parse_sandbox_config({"provider": "boxlite", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.cpus is None
+    assert fake.memory_mib is None
+
+
+@pytest.mark.parametrize("key", ["cpus", "memory_mib"])
+@pytest.mark.parametrize("bad", [0, -1, "8192", 1.5, True])
+def test_parse_boxlite_resources_reject_non_positive_integers(key: str, bad: object) -> None:
+    """A bad value fails loudly at config load, naming the field."""
+    with pytest.raises(ValueError, match=f"sandbox.boxlite.{key}"):
+        parse_sandbox_config(
+            {
+                "provider": "boxlite",
+                "server_url": "https://s.example.com",
+                "boxlite": {key: bad},
+            }
+        )
+
+
 def test_parse_boxlite_local_customization_reaches_launcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

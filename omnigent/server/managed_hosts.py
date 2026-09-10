@@ -71,6 +71,8 @@ stores into ``create_app``):
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
            disk_size_gb: 100                           # shared; default: SDK default
+           cpus: 4                                     # shared; default: 2
+           memory_mib: 8192                            # shared; default: 4096
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -1298,7 +1300,18 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
-            section, {"image", "env", "local", "cloud", "disk_size_gb"}, "sandbox.boxlite"
+            section,
+            {
+                "image",
+                "env",
+                "local",
+                "cloud",
+                "disk_size_gb",
+                "cpus",
+                "memory_mib",
+                "agent_resources",
+            },
+            "sandbox.boxlite",
         )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
@@ -1308,6 +1321,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             home_dir,
             registry,
             _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
+            _parse_provider_positive_int(raw, "boxlite", "cpus"),
+            _parse_provider_positive_int(raw, "boxlite", "memory_mib"),
+            _parse_boxlite_agent_resources(section),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -1677,6 +1693,9 @@ def _boxlite_launcher_factory(
     home_dir: str | None,
     registry: dict[str, object] | None,
     disk_size_gb: int | None,
+    cpus: int | None = None,
+    memory_mib: int | None = None,
+    agent_resources: dict[str, dict[str, int]] | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
@@ -1696,6 +1715,10 @@ def _boxlite_launcher_factory(
         (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
         credential names), or ``None`` for anonymous pulls.
     :param disk_size_gb: Box disk size in GB, or ``None`` for the SDK default.
+    :param cpus: Box vCPU count, or ``None`` for the built-in default.
+    :param memory_mib: Box RAM in MiB, or ``None`` for the built-in default.
+        The built-in is not enough for every workload — a guest-side OOM shows
+        up host-side only as a stalled session — so operators need this knob.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
@@ -1710,9 +1733,58 @@ def _boxlite_launcher_factory(
             home_dir=home_dir,
             registry=registry,
             disk_size_gb=disk_size_gb,
+            cpus=cpus,
+            memory_mib=memory_mib,
+            agent_resources=agent_resources,
         )
 
     return _build
+
+
+def _parse_boxlite_agent_resources(
+    section: dict[str, object],
+) -> dict[str, dict[str, int]] | None:
+    """Parse ``sandbox.boxlite.agent_resources`` — per-agent CPU/RAM overrides.
+
+    Shape::
+
+        agent_resources:
+          my-review-agent: {cpus: 2, memory_mib: 2048}
+          my-test-agent:   {memory_mib: 12288}
+
+    Either field may be given alone; the omitted one falls back to the
+    server-wide value. An agent absent from the map uses the server-wide value,
+    so adding an agent never requires touching this.
+
+    :param section: The ``sandbox.boxlite`` mapping.
+    :returns: The parsed map, or ``None`` when the key is absent.
+    :raises ValueError: On a malformed map, an unknown field, or a
+        non-positive-integer value — named precisely enough to fix.
+    """
+    raw = section.get("agent_resources")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("server config 'sandbox.boxlite.agent_resources' must be a mapping")
+    parsed: dict[str, dict[str, int]] = {}
+    for agent, spec in raw.items():
+        where = f"sandbox.boxlite.agent_resources.{agent}"
+        if not isinstance(spec, dict):
+            raise ValueError(f"server config '{where}' must be a mapping")
+        unknown = set(spec) - {"cpus", "memory_mib"}
+        if unknown:
+            raise ValueError(
+                f"server config '{where}' has unknown key(s): "
+                f"{', '.join(sorted(str(k) for k in unknown))} (allowed: cpus, memory_mib)"
+            )
+        fields: dict[str, int] = {}
+        for key, value in spec.items():
+            # bool is an int subclass; `cpus: true` would silently mean 1.
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"server config '{where}.{key}' must be a positive integer")
+            fields[str(key)] = value
+        parsed[str(agent)] = fields
+    return parsed
 
 
 def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
@@ -3047,7 +3119,7 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[:8]}"
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        sandbox_id = await _provision_sandbox(launcher, host_name, agent_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3137,7 +3209,7 @@ async def relaunch_managed_host(
         )
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+        sandbox_id = await _provision_sandbox(launcher, host.name, agent_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3163,6 +3235,27 @@ async def relaunch_managed_host(
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+
+
+async def _provision_sandbox(
+    launcher: SandboxHostLauncher,
+    name: str,
+    agent_name: str | None = None,
+) -> str:
+    """Provision a sandbox, sizing it per agent where the provider can.
+
+    Gated on the capability, not on the value, exactly as
+    :func:`_start_sandbox_host` is: ``agent_name`` is declared only on a sizing
+    launcher's ``provision``, so the abstract signature does not carry it and
+    the call is cast. A provider leaving the flag ``False`` never sees it.
+
+    Sizing rides ``provision`` rather than ``start_host`` because CPU and RAM
+    are fixed when the box is created — by ``start_host`` the box exists.
+    """
+    if agent_name is not None and launcher.capabilities.sizes_sandbox_by_agent:
+        provision_sized = cast(Callable[..., str], launcher.provision)
+        return await asyncio.to_thread(provision_sized, name, agent_name=agent_name)
+    return await asyncio.to_thread(launcher.provision, name)
 
 
 async def _start_sandbox_host(

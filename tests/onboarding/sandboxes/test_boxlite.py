@@ -782,3 +782,74 @@ def test_run_tolerates_unavailable_streams(fake_boxlite: _FakeBoxliteState) -> N
     box.exec_queue.append((0, [], []))
     result = launcher.run(box_id, "true")
     assert result.returncode == 0
+
+
+def test_resources_for_prefers_the_agent_override() -> None:
+    """A per-agent entry wins over the server-wide value."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"cpus": 8, "memory_mib": 12288}}
+    )
+    assert launcher._resources_for("tester") == (8, 12288)
+
+
+def test_resources_for_falls_back_field_by_field() -> None:
+    """An override may set one field; the other keeps the server-wide value."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    )
+    assert launcher._resources_for("tester") == (2, 12288)
+
+
+def test_resources_for_unknown_or_missing_agent_uses_the_server_wide_value() -> None:
+    """Adding an agent must never require touching the override map."""
+    launcher = BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"cpus": 8}}
+    )
+    assert launcher._resources_for("someone-else") == (2, 4096)
+    assert launcher._resources_for(None) == (2, 4096)
+
+
+def test_boxlite_declares_it_sizes_sandboxes_by_agent() -> None:
+    """The managed path only threads agent_name when this is declared."""
+    assert BoxliteSandboxLauncher().capabilities.sizes_sandbox_by_agent is True
+
+
+def test_provision_cpus_and_memory_reach_box_options(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """The passthrough itself. Gutting it left all 862 tests passing.
+
+    The suite covered config->constructor and `_resources_for()` in isolation,
+    but nothing asserted the values reach `BoxOptions` — so reverting
+    `provision()` to the old hardcoded constants broke nothing. Mirrors
+    test_provision_disk_size_gb_reaches_box_options.
+    """
+    BoxliteSandboxLauncher(cpus=4, memory_mib=8192).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.cpus == 4
+    assert create.options.memory_mib == 8192
+
+
+def test_provision_sizes_the_box_for_the_named_agent(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """The per-agent override must reach BoxOptions, not just _resources_for."""
+    BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    ).provision("managed-abc", agent_name="tester")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.memory_mib == 12288
+    assert create.options.cpus == 2  # falls back field-by-field
+
+
+def test_provision_unknown_agent_gets_the_server_wide_size(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    BoxliteSandboxLauncher(
+        cpus=2, memory_mib=4096, agent_resources={"tester": {"memory_mib": 12288}}
+    ).provision("managed-abc", agent_name="someone-else")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.memory_mib == 4096

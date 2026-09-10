@@ -205,6 +205,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             file_copy=False,
             streaming_exec=False,
             foreground_exec=False,
+            sizes_sandbox_by_agent=True,
         )
 
     def __init__(
@@ -216,6 +217,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         home_dir: str | None = None,
         registry: Mapping[str, object] | None = None,
         disk_size_gb: int | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
+        agent_resources: Mapping[str, Mapping[str, int]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -245,6 +249,14 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             ``password_env`` / ``token_env``. The ``*_env`` keys NAME server
             environment variables holding the credentials (12-factor; values
             never live in config). ``None`` uses anonymous pulls.
+        :param cpus: Box vCPU count — the server's ``sandbox.boxlite.cpus``
+            config. ``None`` keeps the built-in default.
+        :param memory_mib: Box RAM in MiB — the server's
+            ``sandbox.boxlite.memory_mib`` config. ``None`` keeps the built-in
+            default. The built-in 4096 is not enough for every workload: a
+            Python test suite OOM-killed its workers inside the guest, which
+            surfaces host-side only as a stalled session, so this needs to be
+            operator-tunable rather than baked in.
         :param disk_size_gb: Box disk size in GB — the server's
             ``sandbox.boxlite.disk_size_gb`` config. ``None`` uses the SDK's
             own default.
@@ -259,6 +271,11 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._home_dir = home_dir
         self._registry = dict(registry) if registry is not None else None
         self._disk_size_gb = disk_size_gb
+        self._cpus = cpus if cpus is not None else _SANDBOX_CPU
+        self._memory_mib = memory_mib if memory_mib is not None else _SANDBOX_MEMORY_MIB
+        self._agent_resources = {
+            str(agent): dict(spec) for agent, spec in (agent_resources or {}).items()
+        }
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -387,7 +404,23 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 "sandbox.boxlite.cloud.endpoint at a remote `boxlite serve`."
             )
 
-    def provision(self, name: str) -> str:
+    def _resources_for(self, agent_name: str | None) -> tuple[int, int]:
+        """Resolve (cpus, memory_mib) for one job.
+
+        A per-agent entry overrides the server-wide value, and may set either
+        field alone. An unknown agent falls back to the server-wide value, so
+        adding an agent never has to touch this map.
+
+        :param agent_name: Resolved built-in agent, or ``None``.
+        :returns: The ``(cpus, memory_mib)`` this box should be created with.
+        """
+        override = self._agent_resources.get(agent_name or "", {})
+        return (
+            int(override.get("cpus", self._cpus)),
+            int(override.get("memory_mib", self._memory_mib)),
+        )
+
+    def provision(self, name: str, *, agent_name: str | None = None) -> str:
         """
         Create a new BoxLite box from the host image.
 
@@ -405,6 +438,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         _ensure_sdk()
         resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         env = self._resolve_sandbox_env()
+        cpus, memory_mib = self._resources_for(agent_name)
         target = self._endpoint or "local"
         click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
 
@@ -414,8 +448,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             runtime = await self._aruntime()
             options = boxlite.BoxOptions(
                 image=resolved_ref,
-                cpus=_SANDBOX_CPU,
-                memory_mib=_SANDBOX_MEMORY_MIB,
+                cpus=cpus,
+                memory_mib=memory_mib,
                 disk_size_gb=self._disk_size_gb,
                 env=env,
                 auto_remove=False,
