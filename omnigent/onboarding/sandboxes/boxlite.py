@@ -205,6 +205,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             file_copy=False,
             streaming_exec=False,
             foreground_exec=False,
+            sizes_sandbox_by_agent=True,
         )
 
     def __init__(
@@ -216,6 +217,10 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         home_dir: str | None = None,
         registry: Mapping[str, object] | None = None,
         disk_size_gb: int | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
+        agent_resources: Mapping[str, Mapping[str, int]] | None = None,
+        clone_from: str | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -245,9 +250,22 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             ``password_env`` / ``token_env``. The ``*_env`` keys NAME server
             environment variables holding the credentials (12-factor; values
             never live in config). ``None`` uses anonymous pulls.
+        :param cpus: Box vCPU count — the server's ``sandbox.boxlite.cpus``
+            config. ``None`` keeps the built-in default.
+        :param memory_mib: Box RAM in MiB — the server's
+            ``sandbox.boxlite.memory_mib`` config. ``None`` keeps the built-in
+            default. The built-in 4096 is not enough for every workload: a
+            Python test suite OOM-killed its workers inside the guest, which
+            surfaces host-side only as a stalled session, so this needs to be
+            operator-tunable rather than baked in.
         :param disk_size_gb: Box disk size in GB — the server's
             ``sandbox.boxlite.disk_size_gb`` config. ``None`` uses the SDK's
             own default.
+        :param clone_from: Name (or id) of a STOPPED, operator-owned warm box
+            to clone copy-on-write instead of booting the image — the server's
+            ``sandbox.boxlite.clone_from`` config. ``None`` boots the image.
+            When set, ``image`` / ``cpus`` / ``memory_mib`` / ``disk_size_gb``
+            describe the SOURCE box, not the clone (see :meth:`_aclone`).
 
         When ``home_dir`` or ``registry`` is set the launcher builds a
         customized ``Boxlite(Options(...))`` runtime; otherwise it uses the
@@ -259,6 +277,12 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._home_dir = home_dir
         self._registry = dict(registry) if registry is not None else None
         self._disk_size_gb = disk_size_gb
+        self._cpus = cpus if cpus is not None else _SANDBOX_CPU
+        self._memory_mib = memory_mib if memory_mib is not None else _SANDBOX_MEMORY_MIB
+        self._agent_resources = {
+            str(agent): dict(spec) for agent, spec in (agent_resources or {}).items()
+        }
+        self._clone_from = clone_from
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -387,9 +411,26 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 "sandbox.boxlite.cloud.endpoint at a remote `boxlite serve`."
             )
 
-    def provision(self, name: str) -> str:
+    def _resources_for(self, agent_name: str | None) -> tuple[int, int]:
+        """Resolve (cpus, memory_mib) for one job.
+
+        A per-agent entry overrides the server-wide value, and may set either
+        field alone. An unknown agent falls back to the server-wide value, so
+        adding an agent never has to touch this map.
+
+        :param agent_name: Resolved built-in agent, or ``None``.
+        :returns: The ``(cpus, memory_mib)`` this box should be created with.
         """
-        Create a new BoxLite box from the host image.
+        override = self._agent_resources.get(agent_name or "", {})
+        return (
+            int(override.get("cpus", self._cpus)),
+            int(override.get("memory_mib", self._memory_mib)),
+        )
+
+    def provision(self, name: str, *, agent_name: str | None = None) -> str:
+        """
+        Create a new BoxLite box — from the host image, or (when
+        ``clone_from`` is set) copy-on-write from a warm source box.
 
         The box is detached and persistent (``detach=True``,
         ``auto_remove=False``); the managed-session machinery owns its teardown
@@ -400,22 +441,30 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``. Recorded
             as the box name; the returned id is the canonical reference.
         :returns: The box id.
-        :raises click.ClickException: If box creation fails.
+        :raises click.ClickException: If box creation fails, or the configured
+            ``clone_from`` source is missing or running.
         """
         _ensure_sdk()
         resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         env = self._resolve_sandbox_env()
+        cpus, memory_mib = self._resources_for(agent_name)
         target = self._endpoint or "local"
-        click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
+        if self._clone_from:
+            click.echo(f"▸ Cloning boxlite box '{name}' from '{self._clone_from}' ({target})")
+        else:
+            click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
 
         async def _do() -> str:
             import boxlite
 
             runtime = await self._aruntime()
+            if self._clone_from:
+                box = await self._aclone(runtime, self._clone_from, name)
+                return str(box.id)
             options = boxlite.BoxOptions(
                 image=resolved_ref,
-                cpus=_SANDBOX_CPU,
-                memory_mib=_SANDBOX_MEMORY_MIB,
+                cpus=cpus,
+                memory_mib=memory_mib,
                 disk_size_gb=self._disk_size_gb,
                 env=env,
                 auto_remove=False,
@@ -438,6 +487,62 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             raise click.ClickException(f"boxlite box creation failed: {exc}") from exc
         click.echo(f"  → created {box_id}")
         return str(box_id)
+
+    async def _aclone(
+        self, runtime: boxlite_sdk.Boxlite, source: str, name: str
+    ) -> boxlite_sdk.Box:
+        """
+        Clone a warm source box copy-on-write instead of booting the image.
+
+        The source is operator-owned — created and refreshed outside omnigent —
+        and must be STOPPED: a clone copies the source's disks, so cloning a
+        running box captures a mid-write filesystem.
+
+        ``clone_box(*, options=CloneOptions, name=...)`` is the SDK's whole
+        surface here, and ``CloneOptions`` carries no fields (boxlite 0.9.5
+        documents it as a forward-compatible placeholder). So ``image`` /
+        ``cpus`` / ``memory_mib`` / ``disk_size_gb`` / network / secrets all
+        describe the SOURCE box; a clone inherits them and cannot override
+        them. Env is the exception — :meth:`run` applies it per-exec.
+
+        :param runtime: The loop-bound boxlite runtime handle.
+        :param source: Name or id of the warm box to clone.
+        :param name: Name for the new box.
+        :returns: The cloned box handle.
+        :raises click.ClickException: When the source is missing or running.
+        """
+        warm = await runtime.get(source)
+        if warm is None:
+            raise click.ClickException(
+                f"sandbox.boxlite.clone_from names box '{source}', but no box by "
+                "that name exists on this boxlite runtime — create the warm "
+                "source box (and leave it stopped) before launching a managed "
+                "session."
+            )
+        if (await warm.info()).state.running:
+            raise click.ClickException(
+                f"sandbox.boxlite.clone_from box '{source}' is running — stop it "
+                "first. A clone copies the source's disks, so cloning a running "
+                "box captures a mid-write filesystem."
+            )
+        return await warm.clone_box(name=name)
+
+    def _clone_exec_env(self) -> list[tuple[str, str]] | None:
+        """
+        Env to apply on every ``box.exec``, or ``None`` when ``BoxOptions.env``
+        already carries it.
+
+        ``clone_box`` takes no ``BoxOptions``, so a cloned box inherits the
+        SOURCE box's environment and never sees ``sandbox.boxlite.env``.
+        ``box.exec(env=...)`` is the only lane the SDK offers to supply it
+        after the fact, so the clone path resolves the names per exec.
+
+        :raises click.ClickException: When a configured name is not set in the
+            server process environment.
+        """
+        if not self._clone_from:
+            return None
+        return self._resolve_sandbox_env() or None
 
     def _best_effort_remove(self, name_or_id: str) -> None:
         """
@@ -469,6 +574,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             and the command exits non-zero.
         """
         _ensure_sdk()
+        exec_env = self._clone_exec_env()
 
         async def _drain(
             getter: Callable[[], Any], sink: list[str], *, echo: bool, err: bool = False
@@ -504,7 +610,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             # method is bound to a local first so the fork-PR security scan's
             # builtin-exec call heuristic doesn't flag this sandbox command.)
             run_in_box = box.exec
-            execution = await run_in_box("sh", ["-lc", command], timeout_secs=_RUN_TIMEOUT_S)
+            execution = await run_in_box(
+                "sh", ["-lc", command], env=exec_env, timeout_secs=_RUN_TIMEOUT_S
+            )
             out_parts: list[str] = []
             err_parts: list[str] = []
             # Drain both streams concurrently: draining one to EOF first can
