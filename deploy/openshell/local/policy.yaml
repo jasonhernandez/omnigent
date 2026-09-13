@@ -1,0 +1,79 @@
+# OpenShell sandbox policy for the Omnigent host image (local development).
+#
+# Baked into the image at /etc/openshell/policy.yaml, which is where the
+# OpenShell supervisor resolves it from. Two things make it mandatory:
+#
+#  - Identity. The supervisor refuses to start a sandbox that would run as
+#    root ("OCI USER is required because run_as_user is omitted"). The shared
+#    host image keeps root for the other sandbox providers, so the policy
+#    names the non-root `sandbox` user the image already ships.
+#  - Egress. OpenShell is deny-by-default; without an allow-list the in-sandbox
+#    host cannot dial the server back and the agent cannot reach the model.
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  # /opt carries the Omnigent venv (/opt/venv/bin is first on PATH); without it
+  # Landlock denies exec of `omnigent` itself even though the mode bits allow it.
+  read_only: [/usr, /lib, /opt, /proc, /dev/urandom, /app, /etc, /var/log]
+  # /opt/venv is read-write (inside the read-only /opt) so the wheel overlay
+  # `omnigent sandbox create` performs can install into the image venv.
+  # /dev/pts is what lets a pty be allocated: the native harnesses
+  # (claude-native, pi-native, opencode-native) run their CLI under tmux, whose
+  # forkpty() otherwise fails as "out of pty devices" — the mode bits on
+  # /dev/pts/ptmx are 666, so only Landlock is refusing it — and surfaces as
+  # "tmux launch failed: create window failed: fork failed: Permission denied".
+  # Listed as the directory, not /dev/ptmx: that is a symlink into it, and the
+  # supervisor refuses a symlink as a read_write path.
+  read_write: [/sandbox, /tmp, /dev/null, /opt/venv, /dev/pts]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  # Relatively permissive, with one hard constraint learned the hard way: a
+  # wildcard row must NOT overlap a port an attached provider's endpoints use.
+  # An attached provider contributes its own endpoints (github → github.com +
+  # api.github.com:443, the claude profile → api.anthropic.com:443), and an
+  # overlapping row here makes the sandbox's whole policy sync fail — it dies
+  # in Provisioning with "Policy discovery sync failed", never a policy error.
+  # So port 80 is wildcarded, and 443 is listed host by host for the hosts NO
+  # provider owns. Anything a provider owns is deliberately absent below.
+  open_egress_http:
+    name: open-egress-http
+    endpoints:
+      - host: ""
+        ports: [80]
+        allowed_ips: [0.0.0.0/0]
+    binaries:
+      - { path: "/**" }
+
+  # Model providers reached with credentials that still live in the sandbox
+  # (opencode/pi auth files). Hosts owned by an attached OpenShell provider
+  # must not appear here — see the note above.
+  llm_direct:
+    name: llm-direct
+    endpoints:
+      - { host: "api.z.ai", port: 443, protocol: tcp }
+      - { host: "token-plan.ap-southeast-1.maas.aliyuncs.com", port: 443, protocol: tcp }
+      - { host: "models.dev", port: 443, protocol: tcp }
+      - { host: "opencode.ai", port: 443, protocol: tcp }
+    binaries:
+      - { path: "/**" }
+
+  # The Omnigent server on the host machine, via the loopback relay the image
+  # starts. L4 on purpose: the host opens a WebSocket tunnel and an L7 row
+  # proxies plain HTTP but refuses the upgrade.
+  omnigent_server:
+    name: omnigent-server
+    endpoints:
+      - host: host.openshell.internal
+        ports: [6767, 6868, 16767]
+        protocol: tcp
+        allowed_ips: [172.16.0.0/12]
+    binaries:
+      - { path: "/**" }
