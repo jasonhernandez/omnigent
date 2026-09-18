@@ -247,6 +247,7 @@ def register_core_routes(
         agent_id: str | None,
         user_id: str | None,
         sandbox_provider: str | None,
+        sandbox_credential_providers: list[str] | None,
         workspace: str | None,
     ) -> None:
         """
@@ -273,6 +274,9 @@ def register_core_routes(
             owner).
         :param sandbox_provider: Provider to provision, or ``None`` for
             the server's first configured provider.
+        :param sandbox_credential_providers: Credential-provider records
+            the request asked the sandbox to carry, or ``None``. May only
+            narrow what the agent spec or the server config declares.
         :param workspace: Managed workspace — a git repository URL
             (optionally ``#<branch>``) cloned into the sandbox, or
             ``None`` for an empty sandbox.
@@ -338,6 +342,8 @@ def register_core_routes(
                 provider=sandbox_provider,
                 agent_store=agent_store,
                 agent_id=agent_id,
+                agent_cache=agent_cache,
+                requested_credential_providers=sandbox_credential_providers,
             )
         )
         _managed_launch_tasks.add(launch_task)
@@ -654,6 +660,7 @@ def register_core_routes(
                 agent_id=conv.agent_id if conv is not None else None,
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
+                sandbox_credential_providers=body.sandbox_credential_providers,
                 workspace=body.workspace,
             )
 
@@ -827,6 +834,7 @@ def register_core_routes(
                 agent_id=result.agent_id,
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
+                sandbox_credential_providers=parsed_metadata.sandbox_credential_providers,
                 workspace=parsed_metadata.workspace,
             )
         # Caller-supplied external host: bind + launch a runner on it,

@@ -9,10 +9,10 @@ interface and the newer pluggable surface in
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 class SandboxError(Exception):
@@ -87,6 +87,13 @@ class SandboxCapabilities:
         suspend-time snapshot (dependencies installed, caches warm)
         rather than cold-starting it. Only meaningful alongside
         ``resume_stopped``.
+    :param binds_credential_providers: Provider can attach a per-launch
+        set of named credential-provider records to the sandbox it
+        creates, so the capability an agent gets is chosen at launch
+        rather than baked into the deployment. When set, the managed
+        launch path calls ``bind_credential_providers`` before
+        provisioning; a launcher leaving it ``False`` is never asked,
+        and a launch that names providers for it is rejected.
     """
 
     cli_bootstrap: bool = False
@@ -101,6 +108,25 @@ class SandboxCapabilities:
     # New fields append at the end to preserve positional-constructor
     # compatibility for out-of-tree providers.
     snapshot_restore: bool = False
+    binds_credential_providers: bool = False
+
+
+class CredentialProviderBinding(Protocol):
+    """
+    The extra surface a launcher declaring ``binds_credential_providers``
+    carries beyond the base launcher interface.
+
+    The capability flag is the runtime guarantee these methods exist; this
+    protocol is how a caller narrows to them without duck-typing.
+    """
+
+    def bind_credential_providers(self, providers: Sequence[str]) -> None:
+        """Pin the credential-provider records this launch's sandbox gets."""
+        ...
+
+    def credential_providers(self) -> list[str]:
+        """The records a sandbox created now would carry."""
+        ...
 
 
 @dataclass(frozen=True)

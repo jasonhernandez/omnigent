@@ -39,6 +39,8 @@ from omnigent.spec.types import (
     LabelDef,
     LLMConfig,
     LocalToolInfo,
+    ManagedSandboxOpenShellSpec,
+    ManagedSandboxSpec,
     MCPServerConfig,
     ModalityConfig,
     Phase,
@@ -245,6 +247,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    managed_sandbox = _parse_managed_sandbox(raw.get("managed_sandbox"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -311,6 +314,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
+        managed_sandbox=managed_sandbox,
         terminals=terminals,
         timers=timers,
         spawn=spawn,
@@ -836,6 +840,85 @@ def _parse_os_env(
         fork=fork,
         start_in_scratch=start_in_scratch,
     )
+
+
+# Sandbox backends that read the top-level ``managed_sandbox:`` block. Keyed by
+# backend so a knob only one of them understands cannot be declared
+# against another and then silently ignored.
+_MANAGED_SANDBOX_BACKENDS: tuple[str, ...] = ("openshell",)
+
+
+def _parse_managed_sandbox(raw: object) -> ManagedSandboxSpec | None:
+    """
+    Parse the top-level ``managed_sandbox:`` block into a :class:`ManagedSandboxSpec`.
+
+    This block declares what the agent needs from the REMOTE sandbox a
+    managed session provisions for it, and is read server-side before
+    that sandbox exists. It is unrelated to ``os_env.sandbox``, which
+    confines the agent's own process once it is already running.
+
+    :param raw: The raw ``managed_sandbox:`` value from config.yaml — a
+        mapping keyed by sandbox backend, or absent (``None``). Example:
+        ``{"openshell": {"providers": ["gitlab-readonly"]}}``.
+    :returns: A populated :class:`ManagedSandboxSpec` when the block
+        declares something, ``None`` when absent or empty.
+    :raises OmnigentError: If *raw* is not a mapping, names a backend
+        that does not read this block, or holds a malformed
+        ``providers`` list.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            "managed_sandbox must be a YAML mapping keyed by sandbox backend "
+            f"(one of: {', '.join(_MANAGED_SANDBOX_BACKENDS)}), got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    unknown = sorted(str(key) for key in set(raw) - set(_MANAGED_SANDBOX_BACKENDS))
+    if unknown:
+        raise OmnigentError(
+            f"managed_sandbox names backend(s) that do not read this block: {', '.join(unknown)} "
+            f"— supported: {', '.join(_MANAGED_SANDBOX_BACKENDS)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    openshell = _parse_managed_sandbox_openshell(raw.get("openshell"))
+    if openshell is None:
+        return None
+    return ManagedSandboxSpec(openshell=openshell)
+
+
+def _parse_managed_sandbox_openshell(raw: object) -> ManagedSandboxOpenShellSpec | None:
+    """
+    Parse ``managed_sandbox.openshell:`` into a :class:`ManagedSandboxOpenShellSpec`.
+
+    :param raw: The raw ``openshell:`` value — a mapping, or absent.
+        Example: ``{"providers": ["gitlab-readonly"]}``.
+    :returns: The parsed sub-block, or ``None`` when absent or declaring
+        nothing.
+    :raises OmnigentError: If *raw* is not a mapping or ``providers`` is
+        not a list of non-empty strings.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"managed_sandbox.openshell must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    names = raw.get("providers")
+    if names is None:
+        return None
+    # Names are opaque to omnigent — the gateway owns that namespace — so
+    # only the shape is checked, matching the server config's parser.
+    if not isinstance(names, list) or not all(
+        isinstance(name, str) and name.strip() for name in names
+    ):
+        raise OmnigentError(
+            "managed_sandbox.openshell.providers must be a list of OpenShell provider "
+            "record NAMES to attach, e.g. ['gitlab-readonly']",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return ManagedSandboxOpenShellSpec(providers=tuple(name.strip() for name in names))
 
 
 def _parse_terminals(

@@ -2002,6 +2002,62 @@ def test_parse_os_env_non_mapping_raises(tmp_path: Path) -> None:
         parse(tmp_path)
 
 
+def test_parse_managed_sandbox_absent_yields_none(agent_dir: Path) -> None:
+    """No ``managed_sandbox:`` block leaves the deployment's own setting in force.
+
+    What breaks if this fails: every existing agent would start
+    overriding its server's configured credential providers.
+    """
+    assert parse(agent_dir).managed_sandbox is None
+
+
+def test_parse_managed_sandbox_openshell_providers(tmp_path: Path) -> None:
+    """``managed_sandbox.openshell.providers`` parses into the spec's own dataclass.
+
+    What breaks if this fails: an agent cannot declare the credential
+    profile its role needs, and capability stays a property of the
+    deployment rather than the agent.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "implementer",
+        "managed_sandbox": {"openshell": {"providers": ["gitlab-readonly", " gitlab-comment "]}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.managed_sandbox is not None
+    assert spec.managed_sandbox.openshell is not None
+    assert spec.managed_sandbox.openshell.providers == ("gitlab-readonly", "gitlab-comment")
+
+
+def test_parse_managed_sandbox_unknown_backend_raises(tmp_path: Path) -> None:
+    """Naming a backend that does not read this block fails loudly.
+
+    What breaks if this fails: a spec declaring providers under, say,
+    ``modal:`` would parse and then silently grant nothing.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "bad-backend",
+        "managed_sandbox": {"modal": {"providers": ["gitlab-readonly"]}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"do not read this block: modal"):
+        parse(tmp_path)
+
+
+def test_parse_managed_sandbox_malformed_providers_raises(tmp_path: Path) -> None:
+    """A blank or non-string provider name is rejected, like the server config's parser."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-providers",
+        "managed_sandbox": {"openshell": {"providers": ["gitlab-readonly", "  "]}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"managed_sandbox.openshell.providers must be a list"):
+        parse(tmp_path)
+
+
 def test_parse_os_env_sandbox_non_mapping_raises(tmp_path: Path) -> None:
     """A scalar/list under ``os_env.sandbox:`` raises
     OmnigentError — same fail-loud contract as the parent.

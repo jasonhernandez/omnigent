@@ -689,6 +689,40 @@ async def test_managed_session_create_rejects_unconfigured_provider(
     assert "modal" in resp.text
 
 
+async def test_session_create_rejects_credential_providers_on_external_host(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    ``sandbox_credential_providers`` is meaningless without a
+    server-provisioned sandbox, so an external create is a 422 naming the
+    field rather than a silently ignored request.
+    """
+    agent = await create_test_agent(managed_session_env.client, name="managed-creds-external")
+    resp = await managed_session_env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "sandbox_credential_providers": ["gitlab-readonly"]},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "sandbox_credential_providers" in resp.text
+
+
+async def test_managed_session_create_rejects_blank_credential_provider(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """A blank provider name is malformed input, caught at validation."""
+    agent = await create_test_agent(managed_session_env.client, name="managed-creds-blank")
+    resp = await managed_session_env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_credential_providers": ["  "],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert "non-empty" in resp.text
+
+
 async def test_managed_session_create_without_config_fails_clearly(
     runtime_init: None,
     db_uri: str,

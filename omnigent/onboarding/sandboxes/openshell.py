@@ -79,6 +79,13 @@ GATEWAY_ENV_VAR: str = "OPENSHELL_GATEWAY"
 """Gateway name read by the SDK's :meth:`SandboxClient.from_active_cluster`;
 overrides ``~/.config/openshell/active_gateway``."""
 
+PROVIDERS_ENV_VAR: str = "OMNIGENT_OPENSHELL_PROVIDERS"
+"""Comma-separated OpenShell provider names attached to created sandboxes.
+
+An attached provider's credentials reach the sandbox as opaque placeholders
+that the gateway's proxy resolves per request, so the real secret never lands
+in the sandbox the way :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR` values do."""
+
 WORKSPACE_ENV_VAR: str = "OMNIGENT_OPENSHELL_WORKSPACE"
 """Workspace name passed to the OpenShell SDK for sandbox lifecycle
 operations (create, get, delete, wait_ready). Defaults to ``"default"``."""
@@ -185,13 +192,21 @@ class _OpenShellClient:
         """Release the gRPC channel and any bearer-auth resources."""
         self._client.close()
 
-    def create_sandbox(self, *, image: str, env: dict[str, str]) -> str:
-        """Create a sandbox from *image*, wait until ready, return its name."""
+    def create_sandbox(
+        self, *, image: str, env: dict[str, str], providers: Sequence[str] = ()
+    ) -> str:
+        """Create a sandbox from *image*, wait until ready, return its name.
+
+        *providers* names gateway provider records to attach; their credentials
+        arrive as placeholders the proxy resolves per request rather than as
+        readable values inside the sandbox.
+        """
         from openshell._proto import openshell_pb2
 
         spec = openshell_pb2.SandboxSpec(
             template=openshell_pb2.SandboxTemplate(image=image),
             environment=env or {},
+            providers=list(providers),
         )
         ws = self._workspace
         ref = self._guard(
@@ -406,7 +421,11 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         hosts as wakeable while every wake fails, so those installs keep
         the honest ``host_offline`` state instead.
         """
-        return replace(super().capabilities, resume_stopped=_sdk_supports_resume())
+        return replace(
+            super().capabilities,
+            resume_stopped=_sdk_supports_resume(),
+            binds_credential_providers=True,
+        )
 
     def __init__(
         self,
@@ -415,6 +434,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         env: Sequence[str] | None = None,
         cluster: str | None = None,
         workspace: str | None = None,
+        providers: Sequence[str] | None = None,
     ) -> None:
         """
         :param image: Registry image to provision from
@@ -430,12 +450,40 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         :param workspace: OpenShell workspace for sandbox lifecycle
             (``sandbox.openshell.workspace``); ``None`` resolves
             :data:`WORKSPACE_ENV_VAR` then ``"default"``.
+        :param providers: Gateway provider records to attach to every
+            sandbox (``sandbox.openshell.providers``); ``None`` resolves
+            :data:`PROVIDERS_ENV_VAR`. Their credentials reach the sandbox
+            as placeholders the gateway resolves per request.
         """
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
         self._cluster = cluster
+        self._provider_names = tuple(providers) if providers is not None else None
         self._workspace = workspace or os.environ.get(WORKSPACE_ENV_VAR) or _DEFAULT_WORKSPACE
         self._client: _OpenShellClient | None = None
+
+    def bind_credential_providers(self, providers: Sequence[str]) -> None:
+        """
+        Pin the gateway provider records this launcher's sandbox gets.
+
+        Called by the managed launch path once the effective set is
+        resolved (session request, then agent spec, then deployment
+        config), so one server can hand a read-only profile to an
+        implementer agent and a push-capable one to a landing agent.
+        Overrides the constructor's ``providers`` and the env-var
+        fallback for the lifetime of this launcher.
+
+        :param providers: Provider record names; blanks are dropped.
+        """
+        self._provider_names = tuple(name.strip() for name in providers if name.strip())
+
+    def credential_providers(self) -> list[str]:
+        """The provider records a sandbox created now would carry.
+
+        Reflects the binding if one was made, else the deployment's
+        configured set — the ceiling a per-session request may narrow to.
+        """
+        return self._resolve_providers()
 
     def prepare(self) -> None:
         """Preflight: the SDK must be installed and a gateway resolvable."""
@@ -450,7 +498,12 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         env_vars = self._resolve_sandbox_env()
         click.echo(f"▸ Creating OpenShell sandbox from {image}")
         # OpenShell assigns its own petname; the requested `name` is advisory.
-        sandbox_name = self._openshell().create_sandbox(image=image, env=env_vars)
+        providers = self._resolve_providers()
+        if providers:
+            click.echo(f"  → attaching providers: {', '.join(providers)}")
+        sandbox_name = self._openshell().create_sandbox(
+            image=image, env=env_vars, providers=providers
+        )
         click.echo(f"  → created {sandbox_name}")
         return sandbox_name
 
@@ -584,6 +637,14 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         if self._client is None:
             self._client = _OpenShellClient(cluster=self._cluster, workspace=self._workspace)
         return self._client
+
+    def _resolve_providers(self) -> list[str]:
+        """Provider names to attach, from config then :data:`PROVIDERS_ENV_VAR`."""
+        if self._provider_names is not None:
+            names: Sequence[str] = self._provider_names
+        else:
+            names = os.environ.get(PROVIDERS_ENV_VAR, "").split(",")
+        return [name.strip() for name in names if name.strip()]
 
     def _resolve_sandbox_env(self) -> dict[str, str]:
         if self._env_names is not None:

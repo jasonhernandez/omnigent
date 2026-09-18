@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
 from omnigent.onboarding.sandboxes.openshell import (
     HOST_IMAGE_ENV_VAR,
+    PROVIDERS_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     WORKSPACE_ENV_VAR,
     OpenShellSandboxLauncher,
@@ -67,8 +69,10 @@ class _FakeOpenShellAPI:
     def exec_background(self, name: str, command: list[str], *, timeout: int) -> None:
         self.background_calls.append((name, list(command)))
 
-    def create_sandbox(self, *, image: str, env: dict[str, str]) -> str:
-        self.create_kwargs.append({"image": image, "env": env})
+    def create_sandbox(
+        self, *, image: str, env: dict[str, str], providers: Sequence[str] = ()
+    ) -> str:
+        self.create_kwargs.append({"image": image, "env": env, "providers": list(providers)})
         return self.created_name
 
     def run_foreground(self, name: str, command: list[str], *, timeout: int) -> int:
@@ -113,7 +117,102 @@ def test_provision_creates_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     sandbox_name = launcher.provision("test-host")
 
     assert sandbox_name == "petname-abc"
-    assert fake.create_kwargs == [{"image": "custom-image:latest", "env": {}}]
+    assert fake.create_kwargs == [{"image": "custom-image:latest", "env": {}, "providers": []}]
+
+
+def test_provision_attaches_configured_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured provider records ride on the create spec."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(
+        image="img:latest", providers=["github-ci", "anthropic-prod"]
+    )
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == ["github-ci", "anthropic-prod"]
+
+
+def test_provision_reads_providers_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset config falls back to the env var, ignoring blanks."""
+    monkeypatch.setenv(PROVIDERS_ENV_VAR, " github-ci , ,anthropic-prod ")
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == ["github-ci", "anthropic-prod"]
+
+
+def test_bind_credential_providers_overrides_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-launch binding wins over the deployment's configured set."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest", providers=["gitlab-shared"])
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.bind_credential_providers(["gitlab-readonly", " ", " gitlab-comment "])
+    launcher.provision("test-host")
+
+    assert launcher.credential_providers() == ["gitlab-readonly", "gitlab-comment"]
+    assert fake.create_kwargs[0]["providers"] == ["gitlab-readonly", "gitlab-comment"]
+
+
+def test_bind_credential_providers_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binding also wins over the env-var fallback, not just YAML config."""
+    monkeypatch.setenv(PROVIDERS_ENV_VAR, "gitlab-shared")
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.bind_credential_providers(["gitlab-push"])
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == ["gitlab-push"]
+
+
+def test_bind_empty_credential_providers_attaches_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binding an empty set strips the deployment's providers rather than falling back."""
+    monkeypatch.setenv(PROVIDERS_ENV_VAR, "gitlab-shared")
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest", providers=["gitlab-readonly"])
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.bind_credential_providers([])
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == []
+
+
+def test_unbound_credential_providers_report_the_configured_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ceiling a session request narrows to is the configured set."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    launcher = OpenShellSandboxLauncher(image="img:latest", providers=["gitlab-readonly"])
+
+    assert launcher.credential_providers() == ["gitlab-readonly"]
+
+
+def test_launcher_declares_credential_provider_binding() -> None:
+    """The capability the managed launch path gates the binding call on."""
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+
+    assert launcher.capabilities.binds_credential_providers is True
+
+
+def test_provision_without_providers_attaches_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No config and no env var attaches nothing."""
+    monkeypatch.delenv(PROVIDERS_ENV_VAR, raising=False)
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher(image="img:latest")
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.provision("test-host")
+
+    assert fake.create_kwargs[0]["providers"] == []
 
 
 def test_provision_uses_default_image(monkeypatch: pytest.MonkeyPatch) -> None:
