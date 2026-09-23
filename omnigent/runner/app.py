@@ -326,6 +326,9 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Published statuses that mean a session's terminal is still working a turn.
+# ``waiting`` is parked on user input, so it keeps the runner alive too.
+_IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -3128,11 +3131,23 @@ def create_runner_app(
                     return True
         if pending_approvals.has_any_pending():
             return True
-        if process_manager is not None:
-            session_ids = set(_session_start_cache) | set(_session_agent_ids)
-            if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
-                return True
-        return False
+        session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        if process_manager is not None and any(
+            process_manager.has_active_turn(session_id) for session_id in session_ids
+        ):
+            return True
+        return any(_native_turn_in_flight(session_id) for session_id in session_ids)
+
+    def _native_turn_in_flight(session_id: str) -> bool:
+        """Whether a native terminal still reports this session's turn as in flight.
+
+        Native delivery returns once the prompt is typed, so the terminal's own
+        status edges decide when the turn settles. SDK turns are already covered
+        by ``_active_turns`` and need not publish a closing edge.
+        """
+        if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
+            return False
+        return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
 
@@ -3503,6 +3518,8 @@ def create_runner_app(
         # instead of the transport error the severed socket raises.
         error = _build_required_terminal_error(event)
         _required_terminal_exit_errors[event.session_id] = error
+        # A dead required terminal cannot still be working a turn.
+        _native_pane_status.pop(event.session_id, None)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -9974,6 +9991,9 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
+                # Forwarders report these edges straight to the server, so record
+                # them here too; the idle watchdog reads them for native turns.
+                _native_pane_status[conversation_id] = status
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,
