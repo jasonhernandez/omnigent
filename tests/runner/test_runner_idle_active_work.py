@@ -281,6 +281,34 @@ async def test_parked_approval_blocks_idle_shutdown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_terminal_turn_blocks_idle_shutdown() -> None:
+    """A native terminal turn keeps the runner alive until the turn goes idle.
+
+    A pi / opencode turn runs inside its terminal: it is never in the app's
+    in-process turn table and sends no tunnel frames while the agent works.
+    Measured on a KVM box: a pi turn running a long foreground command lost
+    its runner at exactly the 3600s idle window, and the session failed as
+    "Runner disconnected unexpectedly".
+
+    :returns: None.
+    """
+    app = _scaffold_app()
+    registry = app.state.session_resource_registry
+    assert app.state.has_active_work() is False
+    registry.note_session_turn_started("conv_native")
+    assert app.state.has_active_work() is True
+
+    async def _release() -> None:
+        registry.note_external_session_status("conv_native", "idle")
+
+    await _assert_monitor_blocked_then_shuts_down(
+        has_active_work=app.state.has_active_work,
+        release=_release,
+    )
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
 async def test_done_approval_future_does_not_pin_runner() -> None:
     """A completed approval Future left in the registry is not active work.
 

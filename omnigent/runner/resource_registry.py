@@ -678,6 +678,21 @@ class SessionResourceRegistry:
         with self._lock:
             return session_id in self._active_session_turns
 
+    def has_active_session_turns(self) -> bool:
+        """Whether ANY native session has an explicitly observed, unfinished turn.
+
+        The runner's inactivity watchdog asks this. A native terminal turn (pi,
+        opencode, ...) runs inside the terminal, so it leaves no entry in the
+        app's in-process turn table and sends no tunnel frames while the agent
+        works. Without this check the watchdog saw nothing, and a pi turn that
+        ran for an hour lost its runner at ``runner.idle_timeout_s`` (3600s)
+        with the session reported as "Runner disconnected unexpectedly".
+
+        :returns: ``True`` while at least one session is mid-turn.
+        """
+        with self._lock:
+            return bool(self._active_session_turns)
+
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
 

@@ -3128,6 +3128,10 @@ def create_runner_app(
                     return True
         if pending_approvals.has_any_pending():
             return True
+        # A native terminal turn lives in the terminal, not in _active_turns:
+        # without this a long pi/opencode turn was idle-reaped mid-work.
+        if resource_registry is not None and resource_registry.has_active_session_turns():
+            return True
         if process_manager is not None:
             session_ids = set(_session_start_cache) | set(_session_agent_ids)
             if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
