@@ -437,7 +437,10 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         """
         _ensure_sdk()
         resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
-        env = self._resolve_sandbox_env()
+        # Resolved here only so a missing credential still fails the launch
+        # loudly, before a box is made. The values are NOT given to the box:
+        # see ``run``, which is where they go instead.
+        self._resolve_sandbox_env()
         cpus, memory_mib = self._resources_for(agent_name)
         target = self._endpoint or "local"
         click.echo(f"▸ Creating boxlite box '{name}' from {resolved_ref} ({target})")
@@ -451,7 +454,15 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 cpus=cpus,
                 memory_mib=memory_mib,
                 disk_size_gb=self._disk_size_gb,
-                env=env,
+                # No ``env=``, deliberately. BoxLite persists the whole
+                # ``BoxOptions`` as the box's ``box_config`` row in
+                # ``boxlite.db`` — env included, in plaintext — and keeps that
+                # row until the box is removed through the runtime. Every
+                # credential passed here was therefore written to disk once per
+                # box: 611 rows holding a live Claude OAuth token, for one box
+                # on disk, on one host (jasonhernandez/boxrun#97). The values
+                # ride on each ``exec`` instead (``run``), which BoxLite does
+                # not persist.
                 auto_remove=False,
                 detach=True,
             )
@@ -503,6 +514,14 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             and the command exits non-zero.
         """
         _ensure_sdk()
+        # The sandbox env goes on EVERY exec, not on the box (see
+        # ``provision``). A process's exec env is merged over the container's,
+        # so everything a command could see before — the in-box host started
+        # by ``run_background`` and the runners it forwards env to, a
+        # ``git clone`` — sees the same variables now. Resolved per call, so a
+        # rotated credential reaches the next command rather than living on
+        # in the box's creation record.
+        env = self._resolve_sandbox_env()
 
         async def _drain(
             getter: Callable[[], Any], sink: list[str], *, echo: bool, err: bool = False
@@ -538,7 +557,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             # method is bound to a local first so the fork-PR security scan's
             # builtin-exec call heuristic doesn't flag this sandbox command.)
             run_in_box = box.exec
-            execution = await run_in_box("sh", ["-lc", command], timeout_secs=_RUN_TIMEOUT_S)
+            execution = await run_in_box(
+                "sh", ["-lc", command], env=env or None, timeout_secs=_RUN_TIMEOUT_S
+            )
             out_parts: list[str] = []
             err_parts: list[str] = []
             # Drain both streams concurrently: draining one to EOF first can

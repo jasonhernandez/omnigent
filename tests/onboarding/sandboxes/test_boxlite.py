@@ -46,6 +46,7 @@ class _ExecCall:
     command: str
     args: list[str]
     timeout_secs: float | None = None
+    env: object = None
 
 
 class _FakeStream:
@@ -126,7 +127,7 @@ class _FakeBox:
         **kwargs: object,
     ) -> _FakeExecution:
         self.exec_calls.append(
-            _ExecCall(command=command, args=list(args or []), timeout_secs=timeout_secs)
+            _ExecCall(command=command, args=list(args or []), timeout_secs=timeout_secs, env=env)
         )
         if self.exec_raises is not None:
             raise self.exec_raises
@@ -409,18 +410,42 @@ def test_provision_env_passthrough_resolves_from_server_env(
 ) -> None:
     """
     Constructor env NAMES resolve to ``(name, value)`` pairs from the
-    server process environment — the config carries names only.
+    server process environment — the config carries names only — and reach
+    the box on each EXEC, never in ``BoxOptions``: BoxLite persists
+    ``BoxOptions`` (env included, in plaintext) as the box's ``box_config``
+    row, so a credential put there is written to disk once per box
+    (jasonhernandez/boxrun#97).
     """
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
     monkeypatch.setenv("GIT_TOKEN", "ghp-test-456")
 
-    BoxliteSandboxLauncher(env=["OPENAI_API_KEY", "GIT_TOKEN"]).provision("a")
+    launcher = BoxliteSandboxLauncher(env=["OPENAI_API_KEY", "GIT_TOKEN"])
+    box_id = launcher.provision("a")
+    launcher.run(box_id, "true")
 
     [create] = fake_boxlite.create_calls
-    assert create.options.env == [
+    assert create.options.env == []
+    [call] = fake_boxlite.boxes[box_id].exec_calls
+    assert call.env == [
         ("OPENAI_API_KEY", "sk-test-123"),
         ("GIT_TOKEN", "ghp-test-456"),
     ]
+
+
+def test_run_env_is_resolved_per_call(
+    fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotated credential reaches the next command in an existing box."""
+    monkeypatch.setenv("GIT_TOKEN", "old")
+    launcher = BoxliteSandboxLauncher(env=["GIT_TOKEN"])
+    box_id = launcher.provision("a")
+    launcher.run(box_id, "true")
+    monkeypatch.setenv("GIT_TOKEN", "new")
+    launcher.run(box_id, "true")
+
+    first, second = fake_boxlite.boxes[box_id].exec_calls
+    assert first.env == [("GIT_TOKEN", "old")]
+    assert second.env == [("GIT_TOKEN", "new")]
 
 
 def test_provision_env_passthrough_env_var_fallback(
@@ -431,10 +456,14 @@ def test_provision_env_passthrough_env_var_fallback(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
     monkeypatch.setenv("GIT_TOKEN", "ghp-test-456")
 
-    BoxliteSandboxLauncher().provision("a")
+    launcher = BoxliteSandboxLauncher()
+    box_id = launcher.provision("a")
+    launcher.run(box_id, "true")
 
     [create] = fake_boxlite.create_calls
-    assert create.options.env == [
+    assert create.options.env == []
+    [call] = fake_boxlite.boxes[box_id].exec_calls
+    assert call.env == [
         ("OPENAI_API_KEY", "sk-test-123"),
         ("GIT_TOKEN", "ghp-test-456"),
     ]
