@@ -27,9 +27,8 @@ Notes that shape this launcher:
   protobufs, so the spec is built from the generated ``openshell._proto``
   module — the only path to a non-default image.
 - **No file-transfer RPC.** OpenShell exposes command execution but no
-  upload primitive, so :meth:`put` streams the file's bytes to ``cat``
-  over the exec channel's stdin — the same approach NVIDIA's own
-  LangChain backend uses.
+  upload primitive, so :meth:`put` sends a snapshot of the file to ``cat``
+  in bounded exec stdin chunks to stay under the gateway's message cap.
 - **No local port forwarding.** OpenShell has no local→sandbox port
   forward for the in-sandbox App OAuth callback, so the CLI skips that
   auth step automatically (``supports_local_port_forward = False``).
@@ -523,30 +522,27 @@ class OpenShellSandboxLauncher(SandboxLauncher):
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """Copy a local file into the sandbox by piping its bytes to ``cat``.
 
-        Sent in chunks: an exec's stdin rides in a single gRPC message, whose
-        decoded size the gateway caps at 1 MiB, while the shipped wheel bundle
-        runs to tens of megabytes. The first chunk truncates the destination
-        and the rest append, so a retry of the whole upload still starts clean.
-        An empty file still makes one pass, so it is created rather than skipped.
+        Snapshot before sending: another bootstrap may rebuild the source.
+        Each exec's stdin is one gRPC message, capped at 1 MiB by the gateway.
+        The first chunk truncates the destination; later chunks append. Empty
+        files still make one request, and retrying the whole upload starts clean.
         """
+        content = local_path.read_bytes()
         parent = shlex.quote(str(PurePosixPath(remote_path).parent))
         dest = shlex.quote(remote_path)
         client = self._openshell()
-        with local_path.open("rb") as handle:
-            first = True
-            while (chunk := handle.read(_PUT_CHUNK_BYTES)) or first:
-                redirect = ">" if first else ">>"
-                result = client.execute(
-                    sandbox_id,
-                    ["bash", "-c", f"mkdir -p {parent} && cat {redirect} {dest}"],
-                    stdin=chunk,
+        for offset in range(0, max(len(content), 1), _PUT_CHUNK_BYTES):
+            redirect = ">" if offset == 0 else ">>"
+            result = client.execute(
+                sandbox_id,
+                ["bash", "-c", f"mkdir -p {parent} && cat {redirect} {dest}"],
+                stdin=content[offset : offset + _PUT_CHUNK_BYTES],
+            )
+            if result.exit_code != 0:
+                raise click.ClickException(
+                    f"File upload to OpenShell sandbox '{sandbox_id}' failed "
+                    f"(exit {result.exit_code}): {result.stderr.strip()}"
                 )
-                if result.exit_code != 0:
-                    raise click.ClickException(
-                        f"File upload to OpenShell sandbox '{sandbox_id}' failed "
-                        f"(exit {result.exit_code}): {result.stderr.strip()}"
-                    )
-                first = False
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """
