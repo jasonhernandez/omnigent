@@ -71,8 +71,8 @@ stores into ``create_app``):
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
            disk_size_gb: 100                           # shared; default: SDK default
-           cpus: 4                                     # shared; default: 2
-           memory_mib: 8192                            # shared; default: 4096
+           cpus: 2                                     # shared; default: 2
+           memory_mib: 4096                            # shared; default: 4096
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
