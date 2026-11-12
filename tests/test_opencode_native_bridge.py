@@ -341,6 +341,7 @@ def _user_share(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     (share / "opencode").mkdir(parents=True)
     monkeypatch.setenv("XDG_DATA_HOME", str(share))
     monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.delenv("OPENCODE_AUTH_JSON", raising=False)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     return share
 
@@ -417,6 +418,7 @@ def test_seed_opencode_auth_noop_without_source(
     """No auth.json and no v2 DB → None (e.g. on a remote runner)."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-share"))
     monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.delenv("OPENCODE_AUTH_JSON", raising=False)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     bridge_dir = bridge.prepare_bridge_dir("conv_noseed")
     assert bridge.seed_opencode_auth(bridge_dir) is None
@@ -793,3 +795,49 @@ def test_snapshot_opencode_database_source_path_with_uri_special_chars(tmp_path:
         rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
     conn.close()
     assert rows == [("ses_src", None)]
+
+
+def test_seed_opencode_auth_uses_the_carried_store_when_no_file_exists_yet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A box host hands credentials over as $OPENCODE_AUTH_JSON and writes
+    auth.json only later; the seed runs at serve launch and must not come up
+    empty. Measured: serve at 15:21:14.103, the file at 15:21:14.228, and every
+    turn of that session ended provider.no-route."""
+    _user_share(monkeypatch, tmp_path)  # no auth.json in it
+    monkeypatch.setenv(
+        "OPENCODE_AUTH_JSON", '{"alibaba-token-plan": {"type": "api", "key": "k"}}'
+    )
+    bridge_dir = bridge.prepare_bridge_dir("conv_env")
+    dest = bridge.seed_opencode_auth(bridge_dir)
+    assert dest is not None
+    assert json.loads(dest.read_text()) == {
+        "alibaba-token-plan": {"type": "api", "key": "k"}
+    }
+    assert bridge.seeded_provider_ids(bridge_dir) == frozenset({"alibaba-token-plan"})
+
+
+def test_seed_opencode_auth_prefers_the_file_over_the_carried_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text('{"a": {"type": "api", "key": "file"}}')
+    monkeypatch.setenv(
+        "OPENCODE_AUTH_JSON",
+        '{"a": {"type": "api", "key": "env"}, "b": {"type": "api", "key": "env"}}',
+    )
+    dest = bridge.seed_opencode_auth(bridge.prepare_bridge_dir("conv_prec"))
+    assert dest is not None
+    assert json.loads(dest.read_text()) == {
+        "a": {"type": "api", "key": "file"},
+        "b": {"type": "api", "key": "env"},
+    }
+
+
+@pytest.mark.parametrize("carried", ["not json", "[1, 2]", "   "])
+def test_seed_opencode_auth_ignores_an_unusable_carried_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, carried: str
+) -> None:
+    _user_share(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENCODE_AUTH_JSON", carried)
+    assert bridge.seed_opencode_auth(bridge.prepare_bridge_dir("conv_bad")) is None

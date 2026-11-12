@@ -62,6 +62,9 @@ OPENCODE_SERVER_PASSWORD_ENV_VAR = "OPENCODE_SERVER_PASSWORD"
 OPENCODE_DEFAULT_USERNAME = "opencode"
 # Per-session SQLite store ``opencode serve`` keeps sessions and credentials in.
 OPENCODE_DB_ENV_VAR = "OPENCODE_DB"
+# A whole legacy auth.json store, carried as one env var value (how a box host
+# hands credentials to a runner before any file can be written for it).
+OPENCODE_AUTH_JSON_ENV_VAR = "OPENCODE_AUTH_JSON"
 OPENCODE_DB_FILENAME = "opencode.db"
 
 _STATE_FILE = "state.json"
@@ -581,8 +584,9 @@ def seed_opencode_auth(bridge_dir: Path) -> Path | None:
 
     ``opencode serve`` runs with a per-session ``XDG_DATA_HOME`` and DB. OpenCode 2.x
     imports ``$XDG_DATA_HOME/opencode/auth.json`` once, when that DB is created, so
-    seed it with the user's legacy ``auth.json`` plus their v2 SQLite credentials
-    (legacy shape; the DB wins on conflicts). Written ``0600``; refreshed each spawn.
+    seed it with ``$OPENCODE_AUTH_JSON`` (if set), the user's legacy ``auth.json``
+    and their v2 SQLite credentials, in that order of increasing precedence
+    (legacy shape). Written ``0600``; refreshed each spawn.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :returns: The written path, or ``None`` when there are no credentials or the write fails.
@@ -590,6 +594,22 @@ def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     from omnigent.onboarding.opencode_auth import opencode_auth_path, stored_v2_credentials
 
     merged: dict[str, object] = {}
+    # Lowest precedence: the store carried in the environment. A host that
+    # boots a box can only hand credentials over as env (``OPENCODE_AUTH_JSON``
+    # reaches the runner through the ``OPENCODE_`` passthrough); writing them
+    # to auth.json happens later, from outside, and races this one-time seed.
+    # OpenCode 2 imports the per-session auth.json only when its DB is created,
+    # so a seed that lost the race left the session with no credential at all:
+    # every turn ended ``provider.no-route`` / "Model unavailable". A file on
+    # disk and the v2 DB still win wherever they carry the same provider.
+    carried = os.environ.get(OPENCODE_AUTH_JSON_ENV_VAR, "").strip()
+    if carried:
+        try:
+            from_env = json.loads(carried)
+        except ValueError:
+            from_env = None
+        if isinstance(from_env, dict):
+            merged.update({str(k): v for k, v in from_env.items() if v})
     try:
         legacy = json.loads(opencode_auth_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
