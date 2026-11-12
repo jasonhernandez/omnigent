@@ -805,15 +805,11 @@ def test_seed_opencode_auth_uses_the_carried_store_when_no_file_exists_yet(
     empty. Measured: serve at 15:21:14.103, the file at 15:21:14.228, and every
     turn of that session ended provider.no-route."""
     _user_share(monkeypatch, tmp_path)  # no auth.json in it
-    monkeypatch.setenv(
-        "OPENCODE_AUTH_JSON", '{"alibaba-token-plan": {"type": "api", "key": "k"}}'
-    )
+    monkeypatch.setenv("OPENCODE_AUTH_JSON", '{"alibaba-token-plan": {"type": "api", "key": "k"}}')
     bridge_dir = bridge.prepare_bridge_dir("conv_env")
     dest = bridge.seed_opencode_auth(bridge_dir)
     assert dest is not None
-    assert json.loads(dest.read_text()) == {
-        "alibaba-token-plan": {"type": "api", "key": "k"}
-    }
+    assert json.loads(dest.read_text()) == {"alibaba-token-plan": {"type": "api", "key": "k"}}
     assert bridge.seeded_provider_ids(bridge_dir) == frozenset({"alibaba-token-plan"})
 
 
